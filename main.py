@@ -16,7 +16,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
-URL = os.environ.get("URL", "") # Your Koyeb URL
+URL = os.environ.get("URL", "") 
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -33,47 +33,53 @@ if not firebase_admin._apps:
 # --- BOT SETUP ---
 app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- WEB DATA FILTER ---
-def web_data_filter(_, __, message):
-    return bool(message.web_app_data)
-web_data = filters.create(web_data_filter)
-
 # --- HANDLERS ---
+
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     if not URL.startswith("http"):
-        await message.reply("⚠️ **Config Error:** Please set the `URL` variable in Koyeb.")
+        await message.reply("⚠️ **Config Error:** URL variable is missing in Koyeb.")
         return
 
     await message.reply_text(
         f"🎬 **Movie Club**\n\n"
-        f"Hello {message.from_user.first_name}! Tap below to open the library.",
+        f"Hey {message.from_user.first_name}! Click below to watch movies.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 Open App", web_app=WebAppInfo(url=URL))]
         ])
     )
 
-@app.on_message(web_data)
+# --- FIXED: WEB APP DATA HANDLER ---
+# We use filters.service because Web App Data is a service message
+@app.on_message(filters.service & filters.web_app_data)
 async def web_app_data_handler(client, message):
     try:
         unique_id = message.web_app_data.data
+        
+        # 1. Get file from DB
         ref = db.reference(f'files/{unique_id}')
         file_data = ref.get()
         
         if not file_data:
-            await message.reply("❌ File not found.", quote=True)
+            await message.reply("❌ File not found in database.", quote=True)
             return
             
-        await message.reply(f"⬇️ **Sending:** `{file_data['file_name']}`...", quote=True)
+        # 2. Notify user
+        status_msg = await message.reply(f"⬇️ **Sending:** `{file_data['file_name']}`...", quote=True)
         
+        # 3. Send the file
         caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ **Auto-delete in 2 mins.**"
-        sent = await client.send_cached_media(
+        sent_file = await client.send_cached_media(
             chat_id=message.chat.id,
             file_id=file_data['file_id'],
             caption=caption
         )
         
-        asyncio.create_task(delete_later(sent, 120))
+        # 4. Clean up (Delete status message, schedule file delete)
+        await status_msg.delete()
+        asyncio.create_task(delete_later(sent_file, 120))
+        
+        # 5. Send Start menu again so they can search more
         await asyncio.sleep(1)
         await start(client, message)
         
