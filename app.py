@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import re
 from flask import Flask, render_template_string, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, db
@@ -400,7 +401,9 @@ HTML_TEMPLATE = """
         document.getElementById('dOverview').innerText = item.overview || "No synopsis available.";
         document.getElementById('dGenres').innerText = item.media_type === 'tv' ? 'TV Series' : 'Movie';
 
-        // SEARCH WITH TITLE + YEAR TO AVOID WRONG SEQUELS
+        // --- SMART QUERY CONSTRUCTION ---
+        // We append the year to the title to help the backend filter sequels
+        // e.g., Sends "Men in Black 1997" instead of just "Men in Black"
         const searchQuery = year !== 'N/A' ? `${title} ${year}` : title;
         findFiles(searchQuery);
         
@@ -470,13 +473,15 @@ def home():
 def health():
     return "OK", 200
 
-@app_web.route('/api/search_db')
+# --- SMART BACKEND SEARCH ---
+@app.route('/api/search_db')
 def search_db():
     query = request.args.get('query', '').strip()
     if not query: return jsonify([])
 
-    # Strict Logic: Check if ALL words in query exist in filename
-    clean_query_parts = query.lower().split()
+    # 1. Normalize Query: Remove spaces, dots, colons, special chars, and lowercase
+    # "Predator: Badlands 2025" -> "predatorbadlands2025"
+    clean_query = "".join(e for e in query if e.isalnum()).lower()
     
     ref = db.reference('files')
     snapshot = ref.get()
@@ -484,10 +489,14 @@ def search_db():
     results = []
     if snapshot:
         for key, val in snapshot.items():
-            f_name = val.get('file_name', '').lower().replace(".", " ").replace("_", " ")
+            f_name = val.get('file_name', '')
             
-            # This ensures "Men in Black 1997" doesn't match "Men in Black 3"
-            if all(part in f_name for part in clean_query_parts):
+            # 2. Normalize Filename same way
+            # "Predator.Badlands.2025.1080p..." -> "predatorbadlands20251080p..."
+            clean_filename = "".join(e for e in f_name if e.isalnum()).lower()
+            
+            # 3. Check if query is inside filename
+            if clean_query in clean_filename:
                 results.append(val)
     
     return jsonify(results[:50])
