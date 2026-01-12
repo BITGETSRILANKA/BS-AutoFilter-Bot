@@ -1,3 +1,6 @@
 pyrogram
 tgcrypto
 firebase-admin
+flask
+requests
+gunicorn
