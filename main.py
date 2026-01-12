@@ -7,7 +7,11 @@ import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    InlineQueryResultCachedDocument
+)
 from pyrogram.errors import MessageDeleteForbidden
 import firebase_admin
 from firebase_admin import credentials, db
@@ -83,10 +87,12 @@ def get_size(size):
 
 # --- AUTO DELETE FUNCTION ---
 async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, message_type="file"):
+    """Delete a message after specified delay"""
     try:
-        logger.info(f"⏰ Scheduled deletion for {message_type} message {message_id} in {delay_minutes} minutes")
+        # Wait for the delay
         await asyncio.sleep(delay_minutes * 60)
         
+        # Try to delete
         try:
             await app.delete_messages(chat_id, message_id)
             logger.info(f"🗑️ Deleted {message_type} message {message_id}")
@@ -95,12 +101,13 @@ async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, messa
         except Exception as e:
             logger.error(f"❌ Error deleting {message_type} message {message_id}: {e}")
         
+        # Cleanup task
         task_key = f"{message_id}_{chat_id}"
         if task_key in DELETE_TASKS:
             del DELETE_TASKS[task_key]
             
     except asyncio.CancelledError:
-        logger.info(f"⏹️ Deletion cancelled for message {message_id}")
+        pass
     except Exception as e:
         logger.error(f"❌ Error in delete_message_after_delay: {e}")
 
@@ -146,56 +153,92 @@ async def index_files(client, message):
         logger.error(f"❌ Error indexing file: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. COMMANDS & SEARCH
+# 2. INLINE SEARCH HANDLER (NEW FEATURE)
+# -----------------------------------------------------------------------------
+@app.on_inline_query()
+async def answer_inline(client, inline_query):
+    try:
+        query = inline_query.query.lower().strip()
+        
+        # If query is empty, don't search
+        if not query:
+            return
+
+        # Fetch files from DB
+        ref = db.reference('files')
+        snapshot = ref.get()
+
+        if not snapshot:
+            return
+
+        results = []
+        count = 0
+        
+        for key, val in snapshot.items():
+            # Stop if we have enough results (Telegram limit is usually 50)
+            if count >= 50:
+                break
+                
+            f_name = val.get('file_name', '').lower().replace(".", " ")
+            
+            # Simple substring match
+            if query in f_name:
+                count += 1
+                size = get_size(val.get('file_size', 0))
+                file_name_display = val.get('file_name', 'Unknown')
+                
+                # Caption for the sent file (Like in your screenshot)
+                caption = (
+                    f"📂 **{file_name_display}**\n"
+                    f"⚙️ **Size:** {size}\n\n"
+                    f"⚠️ **Note:** This message may auto-delete due to copyright."
+                )
+                
+                # Buttons for the result
+                buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Search Again", switch_inline_query_current_chat="")]
+                ])
+
+                results.append(
+                    InlineQueryResultCachedDocument(
+                        title=f"{file_name_display}",
+                        description=f"Size: {size}",
+                        file_id=val['file_id'],
+                        caption=caption,
+                        reply_markup=buttons
+                    )
+                )
+
+        # Cache results for 1 minute (60s) to reduce DB load
+        if results:
+            await inline_query.answer(results, cache_time=60)
+        else:
+            # Send a "No results" article if nothing found
+            pass 
+
+    except Exception as e:
+        logger.error(f"Inline Error: {e}")
+
+# -----------------------------------------------------------------------------
+# 3. TEXT SEARCH & COMMANDS
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
         "Welcome to **BS Auto Filter Bot** 🎬\n\n"
-        "Send me a movie name and I'll search for it.\n\n"
-        "⚠️ **Auto-Delete Rules:**\n"
-        "• Downloaded files auto-delete in **2 minutes** ⏰\n"
-        "• Search results auto-delete in **10 minutes** ⏰"
+        "You can search by typing text here, or use **Inline Mode**!\n"
+        "Try typing: `@YourBotUserName kaththi` in any chat."
     )
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_command(client, message):
-    await message.reply_text(
-        "**📖 BS Auto Filter Bot Help Guide:**\n\n"
-        "• Just send me a movie name to search\n"
-        "• Click on files to download them\n"
-        "• Use pagination buttons to navigate\n\n"
-        "⏰ **Auto-delete Rules:**\n"
-        "• Downloaded files auto-delete in **2 minutes**\n"
-        "• Search results auto-delete in **10 minutes**\n\n"
-        "Made with ❤️ by **BS Auto Filter Bot**"
-    )
-
-@app.on_message(filters.command("rules") & filters.private)
-async def rules_command(client, message):
-    await message.reply_text(
-        "**📜 BS Auto Filter Bot Rules:**\n\n"
-        "1. Send only movie/series names to search\n"
-        "2. Files are for temporary use only\n"
-        "3. Don't spam the bot\n"
-        "4. Respect all users\n\n"
-        "⏰ **Auto-delete Times:**\n"
-        "• Files: 2 minutes after download\n"
-        "• Search results: 10 minutes\n\n"
-        "⚡ **Features:**\n"
-        "• Fast search from indexed database\n"
-        "• Pagination support\n"
-        "• File size display\n"
-        "• Auto cleanup system"
-    )
+    await message.reply_text("Send me a movie name or use inline search.")
 
 @app.on_message(filters.text & filters.private)
 async def search_handler(client, message):
     query = message.text.strip().lower()
-    
-    if query.startswith('/'):
-        return
+    if query.startswith('/'): return
         
     msg = await message.reply_text("⏳ **Searching...**")
 
@@ -217,10 +260,10 @@ async def search_handler(client, message):
             await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        # FIXED: Store query along with results
+        # --- FIX FOR CALLBACK ERROR: STORE QUERY IN DICT ---
         USER_SEARCHES[message.from_user.id] = {
-            "query": message.text,
-            "results": results
+            "query": message.text,   # Store the query text here
+            "results": results       # Store results list here
         }
         
         await send_results_page(message, msg, page=1)
@@ -237,21 +280,19 @@ async def search_handler(client, message):
         await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 3. PAGINATION WITH AUTO-DELETE SCHEDULING
+# 4. PAGINATION
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1):
     user_id = message.from_user.id
     
-    # FIXED: Retrieve dictionary containing results and query
+    # --- FIX FOR CALLBACK ERROR: GET DATA SAFELY ---
     user_data = USER_SEARCHES.get(user_id)
-
     if not user_data:
         await editable_msg.edit("⚠️ Session expired.")
         return
 
-    # Extract results and the original query string
-    results = user_data["results"]
-    search_query = user_data["query"]
+    results = user_data['results']
+    search_query = user_data['query']
 
     total_results = len(results)
     total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
@@ -277,21 +318,16 @@ async def send_results_page(message, editable_msg, page=1):
     
     current_time = datetime.now().strftime("%H:%M")
     
-    # FIXED: Use stored search_query instead of message.text
+    # Use stored search_query
     text = f"**Found {total_results} Files** 🎬\n" \
            f"Click to download:\n\n" \
-           f"⏰ **Auto-Delete:**\n" \
-           f"• Files: 2 minutes after download\n" \
-           f"• This list: 10 minutes ({current_time})\n\n" \
+           f"⏰ **Auto-Delete:** 2 mins\n" \
            f"*Search: {search_query}*"
 
-    await editable_msg.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    await editable_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 # -----------------------------------------------------------------------------
-# 4. CALLBACKS
+# 5. CALLBACK HANDLER
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -311,9 +347,7 @@ async def callback_handler(client, cb):
             await cb.answer("📂 Sending...")
             
             file_name = file_data.get('file_name', 'Unknown')
-            caption = f"**{file_name}**\n\n" \
-                     f"⏰ **Auto-delete in 2 minutes**\n" \
-                     f"Save quickly if needed!"
+            caption = f"**{file_name}**\n\n⏰ **Auto-delete in 2 minutes**"
             
             sent_message = await client.send_cached_media(
                 chat_id=cb.message.chat.id,
@@ -323,52 +357,36 @@ async def callback_handler(client, cb):
             
             if sent_message:
                 task_key = f"{sent_message.id}_{sent_message.chat.id}"
-                delete_task = asyncio.create_task(
+                DELETE_TASKS[task_key] = asyncio.create_task(
                     delete_message_after_delay(sent_message.id, cb.message.chat.id, 2, "file")
                 )
-                DELETE_TASKS[task_key] = delete_task
                 
-                reminder = await cb.message.reply_text(
-                    f"⏰ **Reminder:** `{file_name}`\n"
-                    f"Will auto-delete in 2 minutes!",
-                    quote=False
-                )
-                
+                reminder = await cb.message.reply_text(f"⏰ `{file_name}` will auto-delete in 2 mins!")
                 reminder_key = f"{reminder.id}_{reminder.chat.id}"
-                reminder_task = asyncio.create_task(
+                DELETE_TASKS[reminder_key] = asyncio.create_task(
                     delete_message_after_delay(reminder.id, cb.message.chat.id, 1, "reminder")
                 )
-                DELETE_TASKS[reminder_key] = reminder_task
 
         elif action == "page":
             user_id = cb.from_user.id
-            # Note: We now check the dictionary wrapper
-            user_data = USER_SEARCHES.get(user_id)
-            
-            if not user_data:
-                await cb.answer("⚠️ Session expired. Search again.")
-                return
-                
-            await send_results_page(cb, cb.message, page=int(data[1]))
-            await cb.answer(f"Page {data[1]}")
+            if user_id in USER_SEARCHES:
+                await send_results_page(cb, cb.message, page=int(data[1]))
+                await cb.answer()
+            else:
+                await cb.answer("⚠️ Expired", show_alert=True)
             
         elif action == "noop":
-            await cb.answer(f"Page {data[1] if len(data) > 1 else 'Current'}")
+            await cb.answer()
 
     except Exception as e:
         logger.error(f"Callback Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 5. CANCEL TASKS & MAIN
+# 6. MAIN & CLEANUP
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
-    logger.info("Cancelling all pending delete tasks...")
-    for task_key, task in list(DELETE_TASKS.items()):
-        try:
-            task.cancel()
-            await task
-        except:
-            pass
+    for task in DELETE_TASKS.values():
+        task.cancel()
     DELETE_TASKS.clear()
 
 def main():
@@ -376,11 +394,10 @@ def main():
     http_thread.start()
     
     print("BS Auto Filter Bot Started...")
-    
     try:
         app.run()
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        pass
     finally:
         asyncio.run(cancel_all_delete_tasks())
 
