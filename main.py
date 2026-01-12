@@ -6,11 +6,11 @@ import asyncio
 import threading
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait, MessageDeleteForbidden, UserNotParticipant
+from pyrogram.errors import FloodWait, MessageDeleteForbidden, UserNotParticipant, BadRequest
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -188,12 +188,12 @@ async def generate_invite_link():
         except:
             pass
         
-        # Create new invite link (expires in 1 day, unlimited uses)
+        # Create new invite link (expires in 7 days, unlimited uses)
         invite_link = await bot.create_chat_invite_link(
             chat_id=JOIN_CHANNEL_ID,
             name="Bot Join Link",
             creates_join_request=False,
-            expire_date=datetime.now().timestamp() + (24 * 60 * 60),  # 24 hours
+            expire_date=int((datetime.now() + timedelta(days=7)).timestamp()),
             member_limit=None  # Unlimited
         )
         
@@ -210,14 +210,14 @@ async def generate_invite_link():
         # Fallback: Try to get chat info and generate basic link
         try:
             chat = await bot.get_chat(JOIN_CHANNEL_ID)
-            if chat.username:
+            if hasattr(chat, 'username') and chat.username:
                 return f"https://t.me/{chat.username}"
             else:
                 # For private channels, we need to create an invite
                 invite = await bot.create_chat_invite_link(
                     chat_id=JOIN_CHANNEL_ID,
                     name="Temporary Bot Join Link",
-                    expire_date=datetime.now().timestamp() + (3600),  # 1 hour
+                    expire_date=int((datetime.now() + timedelta(hours=1)).timestamp()),
                     member_limit=100
                 )
                 return invite.invite_link
@@ -241,13 +241,13 @@ async def get_channel_message_link(channel_id, message_id):
             if channel_id_str.startswith('-100'):
                 channel_num = channel_id_str[4:]
             else:
-                channel_num = channel_id_str
+                channel_num = channel_id_str.lstrip('-')
             
             return f"https://t.me/c/{channel_num}/{message_id}"
             
     except Exception as e:
         logger.error(f"Error generating message link: {e}")
-        return f"https://t.me/c/{str(channel_id).replace('-100', '')}/{message_id}"
+        return f"https://t.me/c/{str(abs(channel_id))}/{message_id}"
 
 # --- CREATE BOT CLIENT ---
 def create_bot():
@@ -265,7 +265,8 @@ def create_bot():
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             workers=2,
-            sleep_threshold=30
+            sleep_threshold=30,
+            in_memory=True  # Use in-memory session to avoid file issues
         )
         print("✅ Bot client created")
         return bot_client
@@ -274,51 +275,69 @@ def create_bot():
         return None
 
 # --- SEARCH AND FILE FUNCTIONS ---
-async def send_results_page(message, editable_msg, page=1):
-    user_id = message.from_user.id
-    results = USER_SEARCHES.get(user_id)
+async def send_results_page(callback, editable_msg, page=1):
+    """Send search results page with pagination"""
+    try:
+        user_id = callback.from_user.id
+        results = USER_SEARCHES.get(user_id)
 
-    if not results:
-        await editable_msg.edit("⚠️ Session expired.")
-        return
+        if not results:
+            await editable_msg.edit("⚠️ Session expired. Please search again.")
+            return
 
-    total_results = len(results)
-    total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
-    start_i = (page - 1) * RESULTS_PER_PAGE
-    current_files = results[start_i : start_i + RESULTS_PER_PAGE]
-
-    buttons = []
-    for file in current_files:
-        size = get_size(file.get('file_size', 0))
-        name = file.get('file_name', 'Unknown')
-        btn_name = name.replace("[", "").replace("]", "")
-        if len(btn_name) > 40: 
-            btn_name = btn_name[:40] + "..."
+        total_results = len(results)
+        total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
         
-        buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"get|{file['unique_id']}")])
+        # Validate page number
+        if page < 1:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
+            
+        start_i = (page - 1) * RESULTS_PER_PAGE
+        end_i = start_i + RESULTS_PER_PAGE
+        current_files = results[start_i:end_i]
 
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
-    if nav: 
-        buttons.append(nav)
-    
-    current_time = datetime.now().strftime("%H:%M")
-    
-    text = f"**Found {total_results} Files** 🎬\n" \
-           f"Click to get movie link:\n\n" \
-           f"⏰ **Auto-Delete:**\n" \
-           f"• Movie posts: 2 minutes\n" \
-           f"• This list: 10 minutes ({current_time})\n\n" \
-           f"*Search: {message.text}*"
+        buttons = []
+        for file in current_files:
+            size = get_size(file.get('file_size', 0))
+            name = file.get('file_name', 'Unknown')
+            btn_name = name.replace("[", "").replace("]", "")
+            if len(btn_name) > 40: 
+                btn_name = btn_name[:40] + "..."
+            
+            buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"get|{file['unique_id']}")])
 
-    await editable_msg.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+        # Navigation buttons
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page|{page-1}"))
+        
+        nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page|{page+1}"))
+        
+        if nav: 
+            buttons.append(nav)
+        
+        current_time = datetime.now().strftime("%H:%M")
+        
+        text = f"**Found {total_results} Files** 🎬\n" \
+               f"Click to get movie link:\n\n" \
+               f"⏰ **Auto-Delete:**\n" \
+               f"• Movie posts: 2 minutes\n" \
+               f"• This list: 10 minutes ({current_time})\n\n" \
+               f"Page: {page}/{total_pages}"
+
+        await editable_msg.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in send_results_page: {e}")
+        await callback.answer(f"Error: {str(e)[:50]}", show_alert=True)
 
 async def post_movie_to_channel(file_data, user_id):
     """Post movie to channel and return message link"""
@@ -335,6 +354,8 @@ async def post_movie_to_channel(file_data, user_id):
                  f"⏰ **Auto-deletes in 2 minutes**\n\n" \
                  f"#BSAutoFilterBot"
         
+        print(f"📤 Posting {file_name} to channel {MOVIE_CHANNEL_ID}...")
+        
         # Post to movie channel
         message = await bot.send_cached_media(
             chat_id=MOVIE_CHANNEL_ID,
@@ -342,12 +363,16 @@ async def post_movie_to_channel(file_data, user_id):
             caption=caption
         )
         
+        print(f"✅ Posted message ID: {message.id}")
+        
         # Generate message link
         message_link = await get_channel_message_link(MOVIE_CHANNEL_ID, message.id)
         
         if not message_link:
             # Fallback link generation
-            message_link = f"https://t.me/c/{str(MOVIE_CHANNEL_ID).replace('-100', '')}/{message.id}"
+            message_link = f"https://t.me/c/{str(abs(MOVIE_CHANNEL_ID))}/{message.id}"
+        
+        print(f"🔗 Generated link: {message_link}")
         
         # Schedule auto-delete in 2 minutes
         task_key = f"{message.id}_{MOVIE_CHANNEL_ID}"
@@ -359,10 +384,15 @@ async def post_movie_to_channel(file_data, user_id):
         return message_link
         
     except FloodWait as e:
+        print(f"⏳ FloodWait while posting: {e}")
         await handle_flood_wait(e, "post_to_channel")
+        return None
+    except BadRequest as e:
+        print(f"❌ BadRequest while posting: {e}")
         return None
     except Exception as e:
         logger.error(f"❌ Error posting to channel: {e}")
+        print(f"❌ Full error posting to channel: {e}")
         return None
 
 # --- BOT COMMAND HANDLERS ---
@@ -560,6 +590,7 @@ def setup_handlers(bot_instance):
                     return
                 
                 await cb.answer("📤 Posting to channel...")
+                print(f"📤 User {cb.from_user.id} requested file: {file_data.get('file_name', 'Unknown')}")
                 
                 # Post movie to channel
                 message_link = await post_movie_to_channel(file_data, cb.from_user.id)
@@ -600,22 +631,22 @@ def setup_handlers(bot_instance):
                 DELETE_TASKS[task_key] = delete_task
 
             elif action == "page":
-                user_id = cb.from_user.id
-                results = USER_SEARCHES.get(user_id)
+                page_num = int(data[1])
+                await cb.answer(f"Loading page {page_num}...")
+                print(f"📄 User {cb.from_user.id} requested page {page_num}")
                 
-                if not results:
-                    await cb.answer("⚠️ Session expired. Search again.", show_alert=True)
-                    return
-                    
-                await send_results_page(cb, cb.message, page=int(data[1]))
-                await cb.answer(f"Page {data[1]}")
+                await send_results_page(cb, cb.message, page=page_num)
                 
             elif action == "noop":
-                await cb.answer("Current page", show_alert=False)
+                await cb.answer()
 
         except Exception as e:
             logger.error(f"Callback Error: {e}")
-            await cb.answer("❌ Error occurred", show_alert=True)
+            print(f"❌ Callback error details: {e}")
+            try:
+                await cb.answer("❌ Error occurred. Please try again.", show_alert=True)
+            except:
+                pass
     
     print("✅ All bot handlers setup complete")
     return bot_instance
@@ -649,27 +680,27 @@ async def start_bot():
             print(f"   Username: @{me.username}")
             print(f"   ID: {me.id}")
             
-            # Send startup notification
-            try:
-                startup_msg = f"🤖 **Bot Started Successfully!**\n\n" \
-                             f"Name: {me.first_name}\n" \
-                             f"Username: @{me.username}\n" \
-                             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
-                             f"✅ **Channels Configured:**\n"
-                
-                if CHANNEL_ID != 0:
-                    startup_msg += f"• Source Channel: {CHANNEL_ID}\n"
-                if MOVIE_CHANNEL_ID != 0:
-                    startup_msg += f"• Movie Channel: {MOVIE_CHANNEL_ID}\n"
-                if JOIN_CHANNEL_ID != 0:
-                    startup_msg += f"• Join Channel: {JOIN_CHANNEL_ID}\n"
-                
-                await bot_instance.send_message(
-                    chat_id=me.id,
-                    text=startup_msg
-                )
-            except Exception as e:
-                print(f"⚠️ Could not send startup message: {e}")
+            # Check bot permissions in channels
+            if CHANNEL_ID != 0:
+                try:
+                    chat = await bot_instance.get_chat(CHANNEL_ID)
+                    print(f"📁 Source Channel: {chat.title} (ID: {CHANNEL_ID})")
+                except Exception as e:
+                    print(f"⚠️ Cannot access source channel: {e}")
+            
+            if MOVIE_CHANNEL_ID != 0:
+                try:
+                    chat = await bot_instance.get_chat(MOVIE_CHANNEL_ID)
+                    print(f"🎬 Movie Channel: {chat.title} (ID: {MOVIE_CHANNEL_ID})")
+                except Exception as e:
+                    print(f"⚠️ Cannot access movie channel: {e}")
+            
+            if JOIN_CHANNEL_ID != 0:
+                try:
+                    chat = await bot_instance.get_chat(JOIN_CHANNEL_ID)
+                    print(f"🔗 Join Channel: {chat.title} (ID: {JOIN_CHANNEL_ID})")
+                except Exception as e:
+                    print(f"⚠️ Cannot access join channel: {e}")
             
             return bot_instance
             
@@ -708,7 +739,7 @@ async def cancel_all_delete_tasks():
 async def run_bot():
     """Main bot runner"""
     print("\n" + "="*50)
-    print("BS AUTO FILTER BOT - USING CHANNEL IDs")
+    print("BS AUTO FILTER BOT - DEBUG MODE")
     print("="*50)
     
     # Setup Firebase
@@ -721,17 +752,20 @@ async def run_bot():
         print("\n" + "="*50)
         print("✅ BOT IS RUNNING WITH ALL FEATURES!")
         print("="*50)
-        print("\n🎯 Channel IDs Mode:")
-        print(f"   Source Channel ID: {CHANNEL_ID if CHANNEL_ID != 0 else 'Not set'}")
-        print(f"   Movie Channel ID: {MOVIE_CHANNEL_ID if MOVIE_CHANNEL_ID != 0 else 'Not set'}")
-        print(f"   Join Channel ID: {JOIN_CHANNEL_ID if JOIN_CHANNEL_ID != 0 else 'Not set'}")
-        print("\n🎯 Features:")
-        print("   • Dynamic invite link generation")
-        print("   • Channel membership check by ID")
-        print("   • Auto message link generation")
-        print("   • 2-min/10-min auto-delete system")
-        print("\n📱 Commands: /start, /channels")
-        print("🌐 Health check: http://localhost:8080/")
+        print("\n🎯 Features Active:")
+        print(f"   • Search with pagination ✓")
+        print(f"   • Movie posting to channel ✓")
+        print(f"   • Auto-delete system (2min/10min) ✓")
+        print(f"   • Dynamic invite links ✓")
+        print(f"   • Channel membership check ✓")
+        print("\n📱 Test Commands:")
+        print("   /start - Welcome message")
+        print("   /channels - Check channel info")
+        print("   Search any movie name")
+        print("\n🔧 Debug Tips:")
+        print("   • Check bot is admin in all channels")
+        print("   • Verify channel IDs are correct")
+        print("   • Check Firebase connection")
         print("="*50)
         
         try:
@@ -752,10 +786,11 @@ async def run_bot():
         print("\n❌ FAILED TO START BOT")
         print("="*50)
         print("Troubleshooting:")
-        print("1. Check all environment variables")
-        print("2. Verify bot token with @BotFather")
-        print("3. Ensure bot is admin in all channels")
-        print("4. Wait if FloodWait restriction")
+        print("1. ✅ Check all environment variables")
+        print("2. 🔑 Verify bot token with @BotFather")
+        print("3. 👑 Ensure bot is ADMIN in all channels")
+        print("4. 🔄 Wait 5 mins if FloodWait error")
+        print("5. 📞 Contact support if issues persist")
         print("="*50)
     
     print("👋 Bot process ended")
@@ -788,9 +823,6 @@ def main():
         print("👋 Application ended")
 
 if __name__ == "__main__":
-    # Import timedelta for invite link expiration
-    from datetime import timedelta
-    
     # Initialize bot variable
     bot = None
     
