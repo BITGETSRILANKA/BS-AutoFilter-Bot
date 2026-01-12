@@ -11,17 +11,16 @@ DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # --- FIREBASE INIT ---
-# We check if firebase is already initialized to avoid conflicts with main.py
 if not firebase_admin._apps and FIREBASE_KEY:
     try:
         cred = credentials.Certificate(json.loads(FIREBASE_KEY))
         firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
     except Exception as e:
-        print(f"Firebase Error in App: {e}")
+        print(f"Firebase Error: {e}")
 
 app_web = Flask(__name__)
 
-# --- THE EXACT UI REPLICA ---
+# --- UI TEMPLATE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -38,8 +37,6 @@ HTML_TEMPLATE = """
             --text-main: #1a1a1a;
             --text-sec: #6c757d;
             --primary: #0088cc;
-            --card-bg: #f8f9fa;
-            --border: #e9ecef;
             --badge-720: #fd7e14;
             --badge-1080: #0d6efd;
             --badge-2160: #198754;
@@ -59,127 +56,89 @@ HTML_TEMPLATE = """
             padding: 15px 20px; background: #fff; position: sticky; top: 0; z-index: 100;
         }
         .brand { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 10px; }
-        .brand i { font-size: 24px; color: #333; }
-        .theme-toggle { background: #f0f0f0; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border: none; cursor: pointer; }
+        .theme-toggle { background: #f0f0f0; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border: none; }
 
         /* SEARCH BAR */
-        .search-container { padding: 0 20px 20px 20px; }
+        .search-container { padding: 0 20px 10px 20px; position:relative; z-index: 101; }
         .search-box {
-            position: relative;
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 50px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-            display: flex; align-items: center;
+            background: #fff; border: 1px solid #e0e0e0; border-radius: 50px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.03); display: flex; align-items: center;
         }
         .search-box input {
-            border: none; background: transparent; padding: 14px 20px; font-size: 16px; width: 100%; outline: none; border-radius: 50px;
+            border: none; background: transparent; padding: 12px 20px; font-size: 15px; width: 100%; outline: none; border-radius: 50px;
         }
         .search-btn {
             background: var(--primary); color: white; border: none;
-            width: 40px; height: 40px; border-radius: 50%;
-            margin-right: 6px; display: flex; align-items: center; justify-content: center;
+            width: 38px; height: 38px; border-radius: 50%;
+            margin-right: 5px; display: flex; align-items: center; justify-content: center;
         }
 
-        /* HOME CONTENT */
-        .section-title { padding: 10px 20px; font-weight: 700; font-size: 18px; }
-        
+        /* HERO CARD (TRENDING) */
         .hero-card {
-            margin: 20px;
-            height: 400px;
+            margin: 10px 20px 20px 20px;
+            height: 420px;
             border-radius: 20px;
             background-size: cover; background-position: center;
-            position: relative;
-            overflow: hidden;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            position: relative; overflow: hidden;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
             display: flex; align-items: flex-end;
             cursor: pointer;
         }
         .hero-overlay {
-            background: linear-gradient(to top, rgba(0,0,0,0.9), transparent);
-            width: 100%; padding: 20px; color: white;
+            background: linear-gradient(to top, rgba(0,0,0,0.95), transparent 90%);
+            width: 100%; padding: 25px; color: white;
+            display: flex; flex-direction: column; gap: 10px;
         }
-        .popular-badge {
+        .popular-pill {
+            background: rgba(80, 80, 80, 0.6); backdrop-filter: blur(10px);
+            padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+            width: fit-content; display: flex; align-items: center; gap: 6px;
+            position: absolute; top: 20px; left: 20px;
+        }
+        .hero-title { font-size: 28px; font-weight: 800; line-height: 1.1; margin-top: 20px; }
+        .hero-desc { font-size: 13px; opacity: 0.8; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        
+        .genre-tags { display: flex; gap: 8px; margin-top: 5px; }
+        .genre-tag {
             background: rgba(255,255,255,0.2); backdrop-filter: blur(5px);
-            padding: 5px 12px; border-radius: 20px; font-size: 12px;
-            display: inline-flex; align-items: center; gap: 5px; margin-bottom: 10px;
+            padding: 5px 12px; border-radius: 15px; font-size: 12px; font-weight: 500;
         }
+
+        /* SEARCH RESULTS LIST (LIKE PHOTO 1) */
+        #searchResults {
+            display: none; padding: 0 20px; margin-top: 10px;
+        }
+        .result-item {
+            display: flex; gap: 15px; margin-bottom: 15px; cursor: pointer;
+        }
+        .result-img {
+            width: 50px; height: 75px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #eee;
+        }
+        .result-info {
+            display: flex; flex-direction: column; justify-content: center; border-bottom: 1px solid #f0f0f0; flex-grow: 1; padding-bottom: 15px;
+        }
+        .result-title { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 4px; }
+        .result-meta { font-size: 13px; color: #888; }
+        .na-img { display: flex; align-items: center; justify-content: center; font-size: 10px; color: #aaa; border: 1px solid #eee; }
 
         /* DETAILS PAGE */
         #detailsPage {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: #fff; z-index: 200; overflow-y: auto;
-            transform: translateX(100%); transition: transform 0.3s ease;
+            transform: translateX(100%); transition: transform 0.25s ease;
             display: none;
         }
         #detailsPage.active { transform: translateX(0); display: block; }
-        
-        .back-btn {
-            position: absolute; top: 15px; left: 15px; z-index: 10;
-            background: rgba(255,255,255,0.8); border-radius: 50%;
-            width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
-        }
-
-        .backdrop {
-            width: 100%; height: 250px; object-fit: cover;
-            mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
-        }
-        
+        .back-btn { position: absolute; top: 15px; left: 15px; z-index: 10; background: #fff; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .backdrop { width: 100%; height: 260px; object-fit: cover; mask-image: linear-gradient(to bottom, black 80%, transparent 100%); }
         .info-container { padding: 0 20px; margin-top: -30px; position: relative; }
-        .movie-title { font-size: 24px; font-weight: 800; margin-bottom: 5px; }
-        .meta-tags { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #666; margin-bottom: 15px; }
-        .pg-badge { border: 1px solid #ccc; padding: 1px 4px; border-radius: 3px; font-size: 11px; font-weight: 700; color: #333; }
+        .btn-play { background: #ff0000; color: white; border: none; width: 100%; padding: 14px; border-radius: 12px; font-weight: 600; font-size: 15px; display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 20px; }
         
-        .btn-play {
-            background: #ff0000; color: white; border: none;
-            width: 100%; padding: 12px; border-radius: 12px;
-            font-weight: 600; font-size: 15px; display: flex; align-items: center; justify-content: center; gap: 8px;
-            margin-bottom: 15px;
-        }
-
-        .section-header { font-size: 18px; font-weight: 700; margin: 20px 0 10px 0; }
-        
-        /* CAST */
-        .cast-scroll { display: flex; gap: 15px; overflow-x: auto; padding-bottom: 10px; }
-        .cast-item { min-width: 80px; text-align: center; }
-        .cast-img { width: 70px; height: 70px; border-radius: 15px; object-fit: cover; margin-bottom: 5px; }
-        .cast-name { font-size: 11px; font-weight: 700; }
-
-        /* EXACT FILE LIST UI */
-        .file-card {
-            display: flex; align-items: center;
-            background: #fff; border: 1px solid #eee;
-            border-radius: 10px; padding: 10px; margin-bottom: 10px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.03);
-            cursor: pointer;
-        }
-        .file-card:active { background-color: #f5f5f5; }
-        
-        .file-icon {
-            width: 45px; height: 45px; background: #eee;
-            border-radius: 8px; display: flex; align-items: center; justify-content: center;
-            margin-right: 12px; color: #555; font-size: 20px;
-        }
-        .file-details { flex: 1; overflow: hidden; }
-        .file-name { font-size: 13px; font-weight: 600; color: #222; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .file-meta { font-size: 11px; color: #888; margin-top: 3px; display: flex; align-items: center; gap: 8px; }
-        
-        .res-badge {
-            font-size: 11px; font-weight: 700; color: white;
-            padding: 3px 8px; border-radius: 6px;
-        }
-        .res-720 { background-color: var(--badge-720); }
-        .res-1080 { background-color: var(--badge-1080); }
-        .res-4k { background-color: var(--badge-2160); }
-        .res-sd { background-color: #6c757d; }
-
-        .hidden { display: none; }
-        .loader { text-align: center; margin-top: 20px; color: var(--primary); }
-
-        /* Horizontal Scroll for Posters */
-        .h-scroll { display: flex; overflow-x: auto; gap: 10px; padding: 0 20px 20px 20px; }
-        .poster-card { min-width: 140px; border-radius: 10px; overflow: hidden; }
-        .poster-card img { width: 100%; height: 210px; object-fit: cover; }
+        /* FILE LIST */
+        .file-card { display: flex; align-items: center; background: #fff; border: 1px solid #eee; border-radius: 12px; padding: 12px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03); cursor: pointer; }
+        .file-icon { width: 45px; height: 45px; background: #f1f3f5; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-right: 12px; color: #555; font-size: 20px; }
+        .res-badge { font-size: 11px; font-weight: 700; color: white; padding: 4px 8px; border-radius: 6px; }
+        .res-720 { background-color: var(--badge-720); } .res-1080 { background-color: var(--badge-1080); } .res-4k { background-color: var(--badge-2160); }
     </style>
 </head>
 <body>
@@ -198,43 +157,36 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <div id="homeContent">
-            <!-- Dynamic Content -->
-             <div class="loader" id="mainLoader"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
-        </div>
+        <!-- HERO SECTION (Only visible when not searching) -->
+        <div id="heroSection"></div>
+
+        <!-- SEARCH RESULTS (Only visible when searching) -->
+        <div id="searchResults"></div>
+
     </div>
 
-    <!-- DETAILS VIEW (MODAL) -->
+    <!-- DETAILS VIEW -->
     <div id="detailsPage">
         <div class="back-btn" onclick="closeDetails()"><i class="fas fa-arrow-left"></i></div>
         <img id="dBackdrop" class="backdrop" src="">
-        
         <div class="info-container">
-            <h1 id="dTitle" class="movie-title"></h1>
-            <div class="meta-tags">
-                <span class="pg-badge">PG-13</span>
-                <span id="dGenres">Action</span> • 
-                <span id="dYear">2024</span>
+            <h1 id="dTitle" style="font-size: 26px; font-weight: 800; margin-bottom: 5px;"></h1>
+            <div style="display:flex; gap:10px; font-size:13px; color:#666; margin-bottom:15px;">
+                <span style="border:1px solid #ccc; padding:0 4px; border-radius:3px; font-weight:700; color:#333;">PG-13</span>
+                <span id="dGenres"></span> • <span id="dYear"></span>
             </div>
 
             <button class="btn-play"><i class="fas fa-play"></i> Play Trailer</button>
             
-            <div style="font-size:14px; font-weight:bold; color:#f5c518; margin-bottom:10px;">
+            <div style="font-size:14px; font-weight:bold; color:#f5c518; margin-bottom:15px;">
                 <i class="fas fa-star"></i> <span id="dRating"></span> IMDb
             </div>
 
-            <h3 class="section-header">Overview</h3>
-            <p id="dOverview" style="font-size:13px; color:#555; line-height:1.5;"></p>
+            <h3 style="font-size:18px; font-weight:700; margin-bottom:10px;">Overview</h3>
+            <p id="dOverview" style="font-size:14px; color:#555; line-height:1.6; margin-bottom:20px;"></p>
 
-            <h3 class="section-header">Cast</h3>
-            <div id="dCast" class="cast-scroll"></div>
-
-            <h3 class="section-header">Available Files <span id="fileCount" style="font-size:14px; color:#888;"></span></h3>
-            
-            <!-- FILE LIST CONTAINER -->
-            <div id="fileListContainer">
-                <div class="loader"><i class="fas fa-spinner fa-spin"></i> Checking database...</div>
-            </div>
+            <h3 style="font-size:18px; font-weight:700; margin-bottom:10px;">Available Files</h3>
+            <div id="fileListContainer"></div>
         </div>
     </div>
 
@@ -245,96 +197,119 @@ HTML_TEMPLATE = """
 
     const tmdbKey = "{{ tmdb_key }}";
     
-    // Init Home
-    fetchPopular();
+    // Genre Map for Tags
+    const genres = { 
+        28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 
+        80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family", 
+        14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music", 
+        9648: "Mystery", 10749: "Romance", 878: "Science Fiction", 
+        10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western" 
+    };
 
-    // Search Listener
+    // Load Trending on Start
+    fetchTrending();
+
+    // Search Logic
     let searchTimeout;
-    document.getElementById('searchInput').addEventListener('input', (e) => {
+    const searchInput = document.getElementById('searchInput');
+    const heroSection = document.getElementById('heroSection');
+    const searchResults = document.getElementById('searchResults');
+
+    searchInput.addEventListener('input', (e) => {
         clearTimeout(searchTimeout);
         const query = e.target.value.trim();
-        if (query.length > 2) {
-            searchTimeout = setTimeout(() => performSearch(query), 800);
-        } else if (query.length === 0) {
-            fetchPopular(); // Reset to home
+
+        if (query.length > 0) {
+            heroSection.style.display = 'none';
+            searchResults.style.display = 'block';
+            searchResults.innerHTML = '<div style="text-align:center; padding:20px; color:#888;"><i class="fas fa-spinner fa-spin"></i></div>';
+            
+            searchTimeout = setTimeout(() => performSearch(query), 500);
+        } else {
+            heroSection.style.display = 'block';
+            searchResults.style.display = 'none';
+            searchResults.innerHTML = '';
         }
     });
 
-    async function fetchPopular() {
-        const res = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${tmdbKey}`);
-        const data = await res.json();
-        renderHome(data.results);
+    async function fetchTrending() {
+        try {
+            const res = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${tmdbKey}`);
+            const data = await res.json();
+            if (data.results && data.results.length > 0) {
+                renderHero(data.results[0]);
+            }
+        } catch (e) { console.error(e); }
+    }
+
+    function renderHero(movie) {
+        // Map Genre IDs to Names (Max 3)
+        const genreNames = movie.genre_ids.slice(0, 3).map(id => genres[id] || "").filter(Boolean);
+        const tagsHtml = genreNames.map(g => `<span class="genre-tag">${g}</span>`).join('');
+
+        const html = `
+            <div class="hero-card" onclick='openDetails(${JSON.stringify(movie)})' style="background-image: url('https://image.tmdb.org/t/p/w500${movie.poster_path}');">
+                <div class="popular-pill"><i class="fas fa-fire" style="color:#ffa500;"></i> Now Popular</div>
+                <div class="hero-overlay">
+                    <div class="genre-tags">${tagsHtml}</div>
+                    <div class="hero-title">${movie.title}</div>
+                    <div class="hero-desc">${movie.overview}</div>
+                </div>
+            </div>
+        `;
+        heroSection.innerHTML = html;
     }
 
     async function performSearch(query) {
-        document.getElementById('homeContent').innerHTML = '<div class="loader"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
-        const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
-        const data = await res.json();
-        renderHome(data.results);
+        try {
+            const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
+            const data = await res.json();
+            
+            searchResults.innerHTML = '';
+            
+            if (!data.results || data.results.length === 0) {
+                searchResults.innerHTML = '<div style="padding:20px; text-align:center; color:#888;">No results found</div>';
+                return;
+            }
+
+            data.results.forEach(item => {
+                if (item.media_type !== 'movie' && item.media_type !== 'tv') return;
+                
+                const title = item.title || item.name;
+                const year = (item.release_date || item.first_air_date || '').split('-')[0];
+                const imgUrl = item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : null;
+                const imgHtml = imgUrl ? `<img src="${imgUrl}" class="result-img">` : `<div class="result-img na-img">N/A</div>`;
+                const type = item.media_type === 'tv' ? 'TV Show' : 'Movie';
+
+                const div = document.createElement('div');
+                div.className = 'result-item';
+                // Pass full object safely
+                div.onclick = () => openDetails(item);
+                div.innerHTML = `
+                    ${imgHtml}
+                    <div class="result-info">
+                        <div class="result-title">${title}</div>
+                        <div class="result-meta">${type} (${year})</div>
+                    </div>
+                `;
+                searchResults.appendChild(div);
+            });
+        } catch (e) { console.error(e); }
     }
 
-    function renderHome(items) {
-        const container = document.getElementById('homeContent');
-        container.innerHTML = '';
-
-        if (!items || items.length === 0) {
-            container.innerHTML = '<p style="text-align:center; color:#999;">No results found.</p>';
-            return;
-        }
-
-        // Hero Item (First Result)
-        const hero = items[0];
-        if (hero.backdrop_path) {
-            const heroEl = document.createElement('div');
-            heroEl.className = 'hero-card';
-            heroEl.style.backgroundImage = `url(https://image.tmdb.org/t/p/w500${hero.poster_path})`;
-            heroEl.onclick = () => openDetails(hero);
-            heroEl.innerHTML = `
-                <div class="hero-overlay">
-                    <div class="popular-badge"><i class="fas fa-fire"></i> Top Result</div>
-                    <div style="font-size:24px; font-weight:800;">${hero.title || hero.name}</div>
-                    <div style="font-size:13px; opacity:0.8;">${(hero.release_date || hero.first_air_date || '').split('-')[0]}</div>
-                </div>
-            `;
-            container.appendChild(heroEl);
-        }
-
-        // Horizontal List for others
-        const title = document.createElement('div');
-        title.className = 'section-title';
-        title.innerText = 'More Results';
-        container.appendChild(title);
-
-        const scroll = document.createElement('div');
-        scroll.className = 'h-scroll';
-        
-        items.slice(1).forEach(item => {
-            if (!item.poster_path) return;
-            const card = document.createElement('div');
-            card.className = 'poster-card';
-            card.onclick = () => openDetails(item);
-            card.innerHTML = `<img src="https://image.tmdb.org/t/p/w200${item.poster_path}">`;
-            scroll.appendChild(card);
-        });
-        container.appendChild(scroll);
-    }
-
-    // --- DETAILS LOGIC ---
-    async function openDetails(item) {
-        // Populate UI
+    // --- DETAILS & FILE LOGIC ---
+    function openDetails(item) {
         document.getElementById('dBackdrop').src = item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : '';
         document.getElementById('dTitle').innerText = item.title || item.name;
         document.getElementById('dYear').innerText = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
-        document.getElementById('dOverview').innerText = item.overview;
-        document.getElementById('dRating').innerText = item.vote_average.toFixed(1);
-
-        // Fetch Cast
-        fetchCast(item.id, item.media_type || 'movie');
+        document.getElementById('dOverview').innerText = item.overview || "No description available.";
+        document.getElementById('dRating').innerText = item.vote_average ? item.vote_average.toFixed(1) : "N/A";
         
-        // Find Files
-        findFiles(item.title || item.name);
+        // Genres string
+        const gList = item.genre_ids ? item.genre_ids.map(id => genres[id]).filter(Boolean).slice(0, 3).join(", ") : "Movie";
+        document.getElementById('dGenres').innerText = gList;
 
-        // Show Page
+        findFiles(item.title || item.name);
         document.getElementById('detailsPage').classList.add('active');
     }
 
@@ -342,49 +317,26 @@ HTML_TEMPLATE = """
         document.getElementById('detailsPage').classList.remove('active');
     }
 
-    async function fetchCast(id, type) {
-        const res = await fetch(`https://api.themoviedb.org/3/${type}/${id}/credits?api_key=${tmdbKey}`);
-        const data = await res.json();
-        const castDiv = document.getElementById('dCast');
-        castDiv.innerHTML = '';
-        
-        data.cast.slice(0, 10).forEach(c => {
-            if(!c.profile_path) return;
-            castDiv.innerHTML += `
-                <div class="cast-item">
-                    <img class="cast-img" src="https://image.tmdb.org/t/p/w200${c.profile_path}">
-                    <div class="cast-name">${c.name}</div>
-                </div>
-            `;
-        });
-    }
-
     async function findFiles(query) {
-        const listDiv = document.getElementById('fileListContainer');
-        listDiv.innerHTML = '<div class="loader"><i class="fas fa-spinner fa-spin"></i> Finding files...</div>';
+        const container = document.getElementById('fileListContainer');
+        container.innerHTML = '<div style="text-align:center; padding:20px; color:#888;"><i class="fas fa-spinner fa-spin"></i> Checking DB...</div>';
         
         const res = await fetch(`/api/search_db?query=${encodeURIComponent(query)}`);
         const files = await res.json();
         
-        document.getElementById('fileCount').innerText = `(${files.length})`;
-        listDiv.innerHTML = '';
-
+        container.innerHTML = '';
         if (files.length === 0) {
-            listDiv.innerHTML = '<p style="text-align:center; color:#999; margin-top:20px;">No files available yet.</p>';
+            container.innerHTML = '<p style="color:#999; text-align:center;">No files available yet.</p>';
             return;
         }
 
         files.forEach(f => {
-            // Quality Detection for Badge
-            let badgeClass = 'res-sd';
-            let badgeText = 'SD';
+            let badgeClass = 'res-720'; 
+            let badgeText = '720p';
             const name = f.file_name.toLowerCase();
+            if (name.includes('1080p')) { badgeClass = 'res-1080'; badgeText = '1080p'; }
+            if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'res-4k'; badgeText = '4K'; }
             
-            if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'res-4k'; badgeText = '2160p'; }
-            else if (name.includes('1080p')) { badgeClass = 'res-1080'; badgeText = '1080p'; }
-            else if (name.includes('720p')) { badgeClass = 'res-720'; badgeText = '720p'; }
-
-            // Size Formatting
             let size = (f.file_size / (1024*1024)).toFixed(0) + ' MB';
             if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
 
@@ -392,17 +344,14 @@ HTML_TEMPLATE = """
             div.className = 'file-card';
             div.onclick = () => tg.sendData(f.unique_id);
             div.innerHTML = `
-                <div class="file-icon"><i class="fas fa-film"></i></div>
-                <div class="file-details">
-                    <div class="file-name">${f.file_name}</div>
-                    <div class="file-meta">
-                        <span>Size: ${size}</span>
-                        <span><i class="fas fa-download"></i> 0</span>
-                    </div>
+                <div class="file-icon"><i class="fas fa-file-video"></i></div>
+                <div style="flex:1; overflow:hidden;">
+                    <div style="font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${f.file_name}</div>
+                    <div style="font-size:12px; color:#888; margin-top:4px;">Size: ${size}</div>
                 </div>
                 <div class="res-badge ${badgeClass}">${badgeText}</div>
             `;
-            listDiv.appendChild(div);
+            container.appendChild(div);
         });
     }
 </script>
@@ -423,8 +372,8 @@ def search_db():
     query = request.args.get('query', '').lower().strip()
     if not query: return jsonify([])
     
-    # Simplify query for better matching (remove year, symbols)
-    simple_query = "".join(e for e in query if e.isalnum()).lower()[:10]
+    # Simple query clean
+    clean_q = "".join(e for e in query if e.isalnum()).lower()[:10]
 
     ref = db.reference('files')
     snapshot = ref.get()
@@ -432,10 +381,9 @@ def search_db():
     results = []
     if snapshot:
         for key, val in snapshot.items():
-            file_n = val.get('file_name', '').lower().replace(".", " ")
-            if query in file_n:
+            f_name = val.get('file_name', '').lower().replace(".", " ")
+            if query in f_name:
                 results.append(val)
-    
     return jsonify(results[:50])
 
 def run_flask_server():
