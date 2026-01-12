@@ -4,9 +4,11 @@ import math
 import logging
 import asyncio
 import threading
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import MessageDeleteForbidden
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -68,6 +70,8 @@ app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 # --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
 RESULTS_PER_PAGE = 10
+# Store scheduled delete tasks
+DELETE_TASKS = {}
 
 # --- HELPER: Size ---
 def get_size(size):
@@ -78,6 +82,31 @@ def get_size(size):
         size /= 1024
         i += 1
     return f"{size:.2f} {units[i]}"
+
+# --- AUTO DELETE FUNCTION ---
+async def delete_file_after_delay(message_id, chat_id, delay_minutes=2):
+    """Delete a message after specified delay"""
+    try:
+        logger.info(f"⏰ Scheduled deletion for message {message_id} in {delay_minutes} minutes")
+        await asyncio.sleep(delay_minutes * 60)  # Convert minutes to seconds
+        
+        # Try to delete the message
+        try:
+            await app.delete_messages(chat_id, message_id)
+            logger.info(f"🗑️ Deleted message {message_id}")
+        except MessageDeleteForbidden:
+            logger.warning(f"⚠️ Cannot delete message {message_id} - forbidden")
+        except Exception as e:
+            logger.error(f"❌ Error deleting message {message_id}: {e}")
+        
+        # Remove task from tracking
+        if message_id in DELETE_TASKS:
+            del DELETE_TASKS[message_id]
+            
+    except asyncio.CancelledError:
+        logger.info(f"⏹️ Deletion cancelled for message {message_id}")
+    except Exception as e:
+        logger.error(f"❌ Error in delete_file_after_delay: {e}")
 
 # -----------------------------------------------------------------------------
 # 1. SMARTER FILE INDEXING (Fixes the "Row/Album" Issue)
@@ -140,7 +169,20 @@ async def index_files(client, message):
 async def start(client, message):
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
-        "Send me a movie name and I'll search for it."
+        "Send me a movie name and I'll search for it.\n\n"
+        "⚠️ **Note:** All downloaded files will be automatically deleted after 2 minutes."
+    )
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_command(client, message):
+    await message.reply_text(
+        "**📖 Help Guide:**\n\n"
+        "• Just send me a movie name to search\n"
+        "• Click on files to download them\n"
+        "• Use pagination buttons to navigate\n\n"
+        "⏰ **Auto-delete feature:**\n"
+        "All downloaded files will be automatically deleted after 2 minutes to save space.\n\n"
+        "Made with ❤️ by Movie Search Bot"
     )
 
 @app.on_message(filters.text & filters.private)
@@ -209,12 +251,13 @@ async def send_results_page(message, editable_msg, page=1):
     if nav: buttons.append(nav)
 
     await editable_msg.edit_text(
-        f"🎬 **Found {total_results} Files**\n👇 Click to download:",
+        f"🎬 **Found {total_results} Files**\n👇 Click to download:\n\n"
+        f"⚠️ **Note:** Files auto-delete in 2 minutes",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # -----------------------------------------------------------------------------
-# 4. CALLBACKS
+# 4. CALLBACKS - SEND FILE WITH AUTO DELETE
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -232,11 +275,36 @@ async def callback_handler(client, cb):
                 return
             
             await cb.answer("📂 Sending...")
-            await client.send_cached_media(
+            
+            # Send file with caption showing auto-delete warning
+            caption = f"{file_data.get('caption', '')}\n\n" \
+                     f"⏰ **This file will be automatically deleted in 2 minutes**"
+            
+            sent_message = await client.send_cached_media(
                 chat_id=cb.message.chat.id,
                 file_id=file_data['file_id'],
-                caption=file_data.get('caption', "")
+                caption=caption
             )
+            
+            # Schedule deletion after 2 minutes
+            if sent_message:
+                delete_task = asyncio.create_task(
+                    delete_file_after_delay(sent_message.id, cb.message.chat.id, 2)
+                )
+                DELETE_TASKS[sent_message.id] = delete_task
+                
+                # Send a reminder message
+                reminder = await cb.message.reply_text(
+                    f"⏰ **Reminder:** File will be deleted in 2 minutes.\n"
+                    f"File: {file_data.get('file_name', 'Unknown')}",
+                    quote=False
+                )
+                
+                # Also schedule deletion of the reminder message
+                reminder_task = asyncio.create_task(
+                    delete_file_after_delay(reminder.id, cb.message.chat.id, 2)
+                )
+                DELETE_TASKS[reminder.id] = reminder_task
 
         elif action == "page":
             await send_results_page(cb, cb.message, page=int(data[1]))
@@ -246,6 +314,28 @@ async def callback_handler(client, cb):
     except Exception as e:
         logger.error(f"Callback Error: {e}")
 
+# -----------------------------------------------------------------------------
+# 5. CANCEL ALL PENDING DELETE TASKS ON STOP
+# -----------------------------------------------------------------------------
+async def cancel_all_delete_tasks():
+    """Cancel all pending delete tasks when bot stops"""
+    logger.info("Cancelling all pending delete tasks...")
+    for message_id, task in list(DELETE_TASKS.items()):
+        try:
+            task.cancel()
+            await task
+        except:
+            pass
+    DELETE_TASKS.clear()
+
+# -----------------------------------------------------------------------------
+# 6. BOT STARTUP AND SHUTDOWN HANDLERS
+# -----------------------------------------------------------------------------
+@app.on_raw_update()
+async def handle_raw_update(client, update, users, chats):
+    # This handles bot startup/shutdown
+    pass
+
 def main():
     # Start HTTP server in a separate thread for Koyeb health checks
     http_thread = threading.Thread(target=run_http_server, daemon=True)
@@ -253,7 +343,15 @@ def main():
     
     # Start the Telegram bot
     print("Bot Started...")
-    app.run()
+    
+    # Setup signal handlers for clean shutdown
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    finally:
+        # Cancel all pending tasks on exit
+        asyncio.run(cancel_all_delete_tasks())
 
 if __name__ == "__main__":
     main()
