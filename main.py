@@ -3,6 +3,8 @@ import json
 import math
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import firebase_admin
@@ -32,6 +34,33 @@ if not firebase_admin._apps:
             logger.error("❌ FIREBASE_KEY is missing")
     except Exception as e:
         logger.error(f"❌ Firebase Error: {e}")
+
+# --- SIMPLE HTTP SERVER FOR KOYEB HEALTH CHECKS ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ['/', '/health', '/ping']:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress the default logging
+        pass
+
+def run_http_server():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"🌐 HTTP Health Check Server started on port {port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 # --- SETUP BOT ---
 app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -217,6 +246,14 @@ async def callback_handler(client, cb):
     except Exception as e:
         logger.error(f"Callback Error: {e}")
 
-if __name__ == "__main__":
+def main():
+    # Start HTTP server in a separate thread for Koyeb health checks
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    
+    # Start the Telegram bot
     print("Bot Started...")
     app.run()
+
+if __name__ == "__main__":
+    main()
