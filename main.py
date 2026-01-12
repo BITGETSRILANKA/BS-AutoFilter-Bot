@@ -1,16 +1,15 @@
 import os
 import json
-import math
 import logging
 import asyncio
 import threading
-from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
+from flask import Flask, render_template_string, request, jsonify
 from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    InlineQueryResultCachedDocument
+    WebAppInfo
 )
 from pyrogram.errors import MessageDeleteForbidden
 import firebase_admin
@@ -24,6 +23,10 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
+# NEW VARIABLES
+URL = os.environ.get("URL", "") # Your Koyeb URL (e.g., https://app-name.koyeb.app)
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "") # Get from themoviedb.org
+
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BSAutoFilterBot")
@@ -35,371 +38,264 @@ if not firebase_admin._apps:
             cred_dict = json.loads(FIREBASE_KEY)
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
-            logger.info("✅ Firebase Initialized Successfully")
+            logger.info("✅ Firebase Initialized")
         else:
-            logger.error("❌ FIREBASE_KEY is missing")
+            logger.error("❌ FIREBASE_KEY missing")
     except Exception as e:
         logger.error(f"❌ Firebase Error: {e}")
 
-# --- SIMPLE HTTP SERVER FOR KOYEB HEALTH CHECKS ---
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ['/', '/health', '/ping']:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'BS Auto Filter Bot is running')
-        else:
-            self.send_response(404)
-            self.end_headers()
+# --- FLASK WEB APP (THE UI) ---
+app_web = Flask(__name__)
+
+# HTML TEMPLATE (The Mini App UI)
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movie Club</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        body { background-color: #1a1a1a; color: #fff; font-family: sans-serif; padding-bottom: 50px; }
+        .search-container { position: sticky; top: 0; z-index: 1000; background: #1a1a1a; padding: 15px; }
+        .movie-card { background: #2c2c2c; border: none; border-radius: 10px; margin-bottom: 15px; overflow: hidden; }
+        .movie-poster { width: 100%; height: auto; border-radius: 10px 10px 0 0; }
+        .file-item { background: #383838; padding: 10px; border-radius: 8px; margin-top: 5px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; }
+        .file-item:active { background: #505050; }
+        .badge-res { font-size: 0.7rem; padding: 4px 6px; border-radius: 4px; }
+        .hidden { display: none; }
+        #loading { text-align: center; margin-top: 20px; }
+    </style>
+</head>
+<body>
+
+<div class="search-container">
+    <div class="input-group">
+        <span class="input-group-text bg-dark border-0 text-white"><i class="fas fa-search"></i></span>
+        <input type="text" id="searchInput" class="form-control bg-dark border-0 text-white" placeholder="Search movies...">
+    </div>
+</div>
+
+<div class="container" id="contentArea">
+    <!-- Content goes here -->
+</div>
+<div id="loading" class="hidden"><div class="spinner-border text-light"></div></div>
+
+<script>
+    const tg = window.Telegram.WebApp;
+    tg.ready();
+    tg.expand();
+
+    const tmdbKey = "{{ tmdb_key }}";
+    let searchTimeout;
+
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+        clearTimeout(searchTimeout);
+        const query = e.target.value.trim();
+        if (query.length > 2) {
+            document.getElementById('loading').classList.remove('hidden');
+            searchTimeout = setTimeout(() => performSearch(query), 800);
+        }
+    });
+
+    async function performSearch(query) {
+        const content = document.getElementById('contentArea');
+        content.innerHTML = '';
+        
+        try {
+            // 1. Fetch Movies from TMDB
+            const tmdbRes = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
+            const tmdbData = await tmdbRes.json();
+            
+            // 2. Fetch Files from our Bot Database
+            const dbRes = await fetch(`/api/search_db?query=${query}`);
+            const dbData = await dbRes.json();
+
+            document.getElementById('loading').classList.add('hidden');
+
+            if (tmdbData.results) {
+                tmdbData.results.forEach(item => {
+                    if (item.media_type !== 'movie' && item.media_type !== 'tv') return;
+                    
+                    const poster = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : 'https://via.placeholder.com/500x750?text=No+Image';
+                    const title = item.title || item.name;
+                    const year = (item.release_date || item.first_air_date || '').split('-')[0];
+                    const overview = item.overview ? item.overview.substring(0, 100) + '...' : 'No description.';
+
+                    // Filter files matching this movie title roughly
+                    const cleanTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '');
+                    const matchingFiles = dbData.filter(f => f.file_name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(cleanTitle.substring(0, 5)));
+
+                    // Only show if we found files OR it's a popular result
+                    const card = document.createElement('div');
+                    card.className = 'movie-card p-3';
+                    
+                    let filesHtml = '';
+                    if (matchingFiles.length > 0) {
+                        filesHtml = `<h6 class="mt-3 text-warning">Available Files (${matchingFiles.length})</h6>`;
+                        matchingFiles.forEach(f => {
+                            let size = (f.file_size / (1024*1024)).toFixed(2) + ' MB';
+                            if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
+                            
+                            filesHtml += `
+                            <div class="file-item" onclick="sendToBot('${f.unique_id}')">
+                                <div>
+                                    <i class="fas fa-file-video text-info me-2"></i>
+                                    <small>${f.file_name.substring(0, 30)}...</small>
+                                </div>
+                                <span class="badge bg-secondary badge-res">${size}</span>
+                            </div>`;
+                        });
+                    } else {
+                        filesHtml = `<p class="text-muted mt-2 small">No files currently available.</p>`;
+                    }
+
+                    card.innerHTML = `
+                        <div class="d-flex">
+                            <img src="${poster}" style="width: 80px; height: 120px; object-fit: cover; border-radius: 5px;">
+                            <div class="ms-3">
+                                <h5>${title} <span class="text-muted small">(${year})</span></h5>
+                                <p class="small text-white-50">${overview}</p>
+                            </div>
+                        </div>
+                        ${filesHtml}
+                    `;
+                    content.appendChild(card);
+                });
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    function sendToBot(unique_id) {
+        tg.sendData(unique_id);
+    }
+</script>
+</body>
+</html>
+"""
+
+@app_web.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE, tmdb_key=TMDB_API_KEY)
+
+@app_web.route('/health')
+def health():
+    return "Alive", 200
+
+@app_web.route('/api/search_db')
+def search_db():
+    query = request.args.get('query', '').lower().strip()
+    if not query: return jsonify([])
     
-    def log_message(self, format, *args):
-        pass
+    ref = db.reference('files')
+    snapshot = ref.get()
+    
+    results = []
+    if snapshot:
+        for key, val in snapshot.items():
+            if query in val.get('file_name', '').lower().replace(".", " "):
+                results.append(val)
+    
+    # Return max 50 to prevent lag
+    return jsonify(results[:50])
 
-def run_http_server():
+def run_flask():
     port = int(os.environ.get('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    logger.info(f"🌐 HTTP Health Check Server started on port {port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    app_web.run(host='0.0.0.0', port=port)
 
-# --- SETUP BOT ---
+# --- TELEGRAM BOT ---
 app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- GLOBAL STORAGE ---
-USER_SEARCHES = {}
-RESULTS_PER_PAGE = 10
 DELETE_TASKS = {}
 
-# --- HELPER: Size ---
-def get_size(size):
-    if not size: return "0B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    while size >= 1024 and i < len(units) - 1:
-        size /= 1024
-        i += 1
-    return f"{size:.2f} {units[i]}"
-
-# --- AUTO DELETE FUNCTION ---
-async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, message_type="file"):
-    """Delete a message after specified delay"""
+async def delete_after(message, delay=120):
+    await asyncio.sleep(delay)
     try:
-        # Wait for the delay
-        await asyncio.sleep(delay_minutes * 60)
-        
-        # Try to delete
-        try:
-            await app.delete_messages(chat_id, message_id)
-            logger.info(f"🗑️ Deleted {message_type} message {message_id}")
-        except MessageDeleteForbidden:
-            logger.warning(f"⚠️ Cannot delete {message_type} message {message_id} - forbidden")
-        except Exception as e:
-            logger.error(f"❌ Error deleting {message_type} message {message_id}: {e}")
-        
-        # Cleanup task
-        task_key = f"{message_id}_{chat_id}"
-        if task_key in DELETE_TASKS:
-            del DELETE_TASKS[task_key]
-            
-    except asyncio.CancelledError:
+        await message.delete()
+    except:
         pass
-    except Exception as e:
-        logger.error(f"❌ Error in delete_message_after_delay: {e}")
 
-# -----------------------------------------------------------------------------
-# 1. SMARTER FILE INDEXING
-# -----------------------------------------------------------------------------
+# 1. Start Command with WEB APP BUTTON
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    # This URL must be your Koyeb/Heroku URL
+    web_app_url = URL  
+    
+    await message.reply_text(
+        f"👋 **Hey {message.from_user.first_name}!**\n\n"
+        "Click the button below to open the **Movie Club App**! 🎬\n"
+        "Search movies, see posters, and download files instantly.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Open Movie App", web_app=WebAppInfo(url=web_app_url))],
+            [InlineKeyboardButton("🔍 Inline Search", switch_inline_query_current_chat="")]
+        ])
+    )
+
+# 2. Handle Data Sent from Web App
+@app.on_message(filters.service & filters.web_app_data)
+async def web_app_data_handler(client, message):
+    try:
+        unique_id = message.web_app_data.data
+        
+        # Get file from DB
+        ref = db.reference(f'files/{unique_id}')
+        file_data = ref.get()
+        
+        if not file_data:
+            await message.reply("❌ File no longer exists.", quote=True)
+            return
+            
+        await message.reply(f"📂 **Retrieving:** `{file_data['file_name']}`...", quote=True)
+        
+        # Send the file
+        caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ Auto-delete in 2 mins."
+        sent_msg = await client.send_cached_media(
+            chat_id=message.chat.id,
+            file_id=file_data['file_id'],
+            caption=caption
+        )
+        
+        # Schedule Delete
+        asyncio.create_task(delete_after(sent_msg, 120))
+        
+        # AUTO SEND START AGAIN (As requested)
+        await asyncio.sleep(1) # Small delay for UX
+        await start(client, message)
+        
+    except Exception as e:
+        logger.error(f"Web App Error: {e}")
+
+# 3. File Indexing (Same as before)
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
     try:
         media = message.document or message.video
         if not media: return
-
-        filename = getattr(media, "file_name", None)
         
-        if not filename:
-            if message.caption:
-                filename = message.caption.split("\n")[0].strip()
-                if message.video and not "." in filename:
-                    filename += ".mp4"
-                elif message.document and not "." in filename:
-                    filename += ".mkv"
-            else:
-                filename = f"Video_{message.id}.mp4"
-
-        valid_exts = ('.mkv', '.mp4', '.avi', '.webm', '.mov')
-        if not filename.lower().endswith(valid_exts) and not message.video:
-            return
+        filename = getattr(media, "file_name", None) or f"Video_{message.id}.mp4"
+        if message.caption: filename = message.caption.split("\n")[0].strip()
 
         file_data = {
             "file_name": filename,
             "file_size": media.file_size,
             "file_id": media.file_id,
             "unique_id": media.file_unique_id,
-            "caption": message.caption or filename
         }
-
-        ref = db.reference(f'files/{media.file_unique_id}')
-        ref.set(file_data)
-        
-        logger.info(f"✅ Indexed: {filename} (ID: {message.id})")
-
+        db.reference(f'files/{media.file_unique_id}').set(file_data)
+        logger.info(f"Indexed: {filename}")
     except Exception as e:
-        logger.error(f"❌ Error indexing file: {e}")
+        logger.error(e)
 
-# -----------------------------------------------------------------------------
-# 2. INLINE SEARCH HANDLER (NEW FEATURE)
-# -----------------------------------------------------------------------------
-@app.on_inline_query()
-async def answer_inline(client, inline_query):
-    try:
-        query = inline_query.query.lower().strip()
-        
-        # If query is empty, don't search
-        if not query:
-            return
-
-        # Fetch files from DB
-        ref = db.reference('files')
-        snapshot = ref.get()
-
-        if not snapshot:
-            return
-
-        results = []
-        count = 0
-        
-        for key, val in snapshot.items():
-            # Stop if we have enough results (Telegram limit is usually 50)
-            if count >= 50:
-                break
-                
-            f_name = val.get('file_name', '').lower().replace(".", " ")
-            
-            # Simple substring match
-            if query in f_name:
-                count += 1
-                size = get_size(val.get('file_size', 0))
-                file_name_display = val.get('file_name', 'Unknown')
-                
-                # Caption for the sent file (Like in your screenshot)
-                caption = (
-                    f"📂 **{file_name_display}**\n"
-                    f"⚙️ **Size:** {size}\n\n"
-                    f"⚠️ **Note:** This message may auto-delete due to copyright."
-                )
-                
-                # Buttons for the result
-                buttons = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Search Again", switch_inline_query_current_chat="")]
-                ])
-
-                results.append(
-                    InlineQueryResultCachedDocument(
-                        title=f"{file_name_display}",
-                        description=f"Size: {size}",
-                        file_id=val['file_id'],
-                        caption=caption,
-                        reply_markup=buttons
-                    )
-                )
-
-        # Cache results for 1 minute (60s) to reduce DB load
-        if results:
-            await inline_query.answer(results, cache_time=60)
-        else:
-            # Send a "No results" article if nothing found
-            pass 
-
-    except Exception as e:
-        logger.error(f"Inline Error: {e}")
-
-# -----------------------------------------------------------------------------
-# 3. TEXT SEARCH & COMMANDS
-# -----------------------------------------------------------------------------
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    await message.reply_text(
-        f"👋 **Hey {message.from_user.first_name}!**\n"
-        "Welcome to **BS Auto Filter Bot** 🎬\n\n"
-        "You can search by typing text here, or use **Inline Mode**!\n"
-        "Try typing: `@YourBotUserName kaththi` in any chat."
-    )
-
-@app.on_message(filters.command("help") & filters.private)
-async def help_command(client, message):
-    await message.reply_text("Send me a movie name or use inline search.")
-
-@app.on_message(filters.text & filters.private)
-async def search_handler(client, message):
-    query = message.text.strip().lower()
-    if query.startswith('/'): return
-        
-    msg = await message.reply_text("⏳ **Searching...**")
-
-    try:
-        ref = db.reference('files')
-        snapshot = ref.get()
-
-        if not snapshot:
-            await msg.edit("❌ Database is empty.")
-            return
-
-        results = []
-        for key, val in snapshot.items():
-            f_name = val.get('file_name', '').lower().replace(".", " ")
-            if query in f_name:
-                results.append(val)
-        
-        if not results:
-            await msg.edit(f"❌ No results found for: `{query}`")
-            return
-
-        # --- FIX FOR CALLBACK ERROR: STORE QUERY IN DICT ---
-        USER_SEARCHES[message.from_user.id] = {
-            "query": message.text,   # Store the query text here
-            "results": results       # Store results list here
-        }
-        
-        await send_results_page(message, msg, page=1)
-        
-        if msg:
-            task_key = f"{msg.id}_{msg.chat.id}"
-            delete_task = asyncio.create_task(
-                delete_message_after_delay(msg.id, msg.chat.id, 10, "search_results")
-            )
-            DELETE_TASKS[task_key] = delete_task
-
-    except Exception as e:
-        logger.error(f"Search Error: {e}")
-        await msg.edit("❌ Error occurred.")
-
-# -----------------------------------------------------------------------------
-# 4. PAGINATION
-# -----------------------------------------------------------------------------
-async def send_results_page(message, editable_msg, page=1):
-    user_id = message.from_user.id
-    
-    # --- FIX FOR CALLBACK ERROR: GET DATA SAFELY ---
-    user_data = USER_SEARCHES.get(user_id)
-    if not user_data:
-        await editable_msg.edit("⚠️ Session expired.")
-        return
-
-    results = user_data['results']
-    search_query = user_data['query']
-
-    total_results = len(results)
-    total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
-    start_i = (page - 1) * RESULTS_PER_PAGE
-    current_files = results[start_i : start_i + RESULTS_PER_PAGE]
-
-    buttons = []
-    for file in current_files:
-        size = get_size(file.get('file_size', 0))
-        name = file.get('file_name', 'Unknown')
-        btn_name = name.replace("[", "").replace("]", "")
-        if len(btn_name) > 40: btn_name = btn_name[:40] + "..."
-        
-        buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"dl|{file['unique_id']}")])
-
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
-    if nav: buttons.append(nav)
-    
-    current_time = datetime.now().strftime("%H:%M")
-    
-    # Use stored search_query
-    text = f"**Found {total_results} Files** 🎬\n" \
-           f"Click to download:\n\n" \
-           f"⏰ **Auto-Delete:** 2 mins\n" \
-           f"*Search: {search_query}*"
-
-    await editable_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-# -----------------------------------------------------------------------------
-# 5. CALLBACK HANDLER
-# -----------------------------------------------------------------------------
-@app.on_callback_query()
-async def callback_handler(client, cb):
-    try:
-        data = cb.data.split("|")
-        action = data[0]
-
-        if action == "dl":
-            unique_id = data[1]
-            ref = db.reference(f'files/{unique_id}')
-            file_data = ref.get()
-
-            if not file_data:
-                await cb.answer("❌ File not found.", show_alert=True)
-                return
-            
-            await cb.answer("📂 Sending...")
-            
-            file_name = file_data.get('file_name', 'Unknown')
-            caption = f"**{file_name}**\n\n⏰ **Auto-delete in 2 minutes**"
-            
-            sent_message = await client.send_cached_media(
-                chat_id=cb.message.chat.id,
-                file_id=file_data['file_id'],
-                caption=caption
-            )
-            
-            if sent_message:
-                task_key = f"{sent_message.id}_{sent_message.chat.id}"
-                DELETE_TASKS[task_key] = asyncio.create_task(
-                    delete_message_after_delay(sent_message.id, cb.message.chat.id, 2, "file")
-                )
-                
-                reminder = await cb.message.reply_text(f"⏰ `{file_name}` will auto-delete in 2 mins!")
-                reminder_key = f"{reminder.id}_{reminder.chat.id}"
-                DELETE_TASKS[reminder_key] = asyncio.create_task(
-                    delete_message_after_delay(reminder.id, cb.message.chat.id, 1, "reminder")
-                )
-
-        elif action == "page":
-            user_id = cb.from_user.id
-            if user_id in USER_SEARCHES:
-                await send_results_page(cb, cb.message, page=int(data[1]))
-                await cb.answer()
-            else:
-                await cb.answer("⚠️ Expired", show_alert=True)
-            
-        elif action == "noop":
-            await cb.answer()
-
-    except Exception as e:
-        logger.error(f"Callback Error: {e}")
-
-# -----------------------------------------------------------------------------
-# 6. MAIN & CLEANUP
-# -----------------------------------------------------------------------------
-async def cancel_all_delete_tasks():
-    for task in DELETE_TASKS.values():
-        task.cancel()
-    DELETE_TASKS.clear()
-
-def main():
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-    
-    print("BS Auto Filter Bot Started...")
-    try:
-        app.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        asyncio.run(cancel_all_delete_tasks())
-
+# --- MAIN ENTRY POINT ---
 if __name__ == "__main__":
-    main()
+    # Start Flask in background thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    
+    # Start Bot
+    print("Bot & Web App Started...")
+    app.run()
