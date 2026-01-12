@@ -33,6 +33,12 @@ if not firebase_admin._apps:
 # --- BOT SETUP ---
 app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# --- 🛠️ CUSTOM FILTER (FIXES THE CRASH) ---
+def check_web_app(_, __, message):
+    return bool(message.web_app_data)
+
+web_filter = filters.create(check_web_app)
+
 # --- HANDLERS ---
 
 @app.on_message(filters.command("start") & filters.private)
@@ -49,9 +55,8 @@ async def start(client, message):
         ])
     )
 
-# --- FIXED: WEB APP DATA HANDLER ---
-# We use filters.service because Web App Data is a service message
-@app.on_message(filters.service & filters.web_app_data)
+# --- WEB APP DATA HANDLER ---
+@app.on_message(web_filter)
 async def web_app_data_handler(client, message):
     try:
         unique_id = message.web_app_data.data
