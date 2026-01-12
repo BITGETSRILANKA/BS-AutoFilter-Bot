@@ -25,7 +25,7 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # NEW VARIABLES
 URL = os.environ.get("URL", "") # Your Koyeb URL (e.g., https://app-name.koyeb.app)
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "") # Get from themoviedb.org
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "") 
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +47,7 @@ if not firebase_admin._apps:
 # --- FLASK WEB APP (THE UI) ---
 app_web = Flask(__name__)
 
-# HTML TEMPLATE (The Mini App UI)
+# HTML TEMPLATE 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -79,9 +79,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<div class="container" id="contentArea">
-    <!-- Content goes here -->
-</div>
+<div class="container" id="contentArea"></div>
 <div id="loading" class="hidden"><div class="spinner-border text-light"></div></div>
 
 <script>
@@ -106,11 +104,9 @@ HTML_TEMPLATE = """
         content.innerHTML = '';
         
         try {
-            // 1. Fetch Movies from TMDB
             const tmdbRes = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
             const tmdbData = await tmdbRes.json();
             
-            // 2. Fetch Files from our Bot Database
             const dbRes = await fetch(`/api/search_db?query=${query}`);
             const dbData = await dbRes.json();
 
@@ -125,11 +121,9 @@ HTML_TEMPLATE = """
                     const year = (item.release_date || item.first_air_date || '').split('-')[0];
                     const overview = item.overview ? item.overview.substring(0, 100) + '...' : 'No description.';
 
-                    // Filter files matching this movie title roughly
                     const cleanTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '');
                     const matchingFiles = dbData.filter(f => f.file_name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(cleanTitle.substring(0, 5)));
 
-                    // Only show if we found files OR it's a popular result
                     const card = document.createElement('div');
                     card.className = 'movie-card p-3';
                     
@@ -200,8 +194,6 @@ def search_db():
         for key, val in snapshot.items():
             if query in val.get('file_name', '').lower().replace(".", " "):
                 results.append(val)
-    
-    # Return max 50 to prevent lag
     return jsonify(results[:50])
 
 def run_flask():
@@ -219,29 +211,36 @@ async def delete_after(message, delay=120):
     except:
         pass
 
-# 1. Start Command with WEB APP BUTTON
+# --- 1. Custom Filter for Web App Data (FIXED) ---
+# This manual filter works on all versions and prevents the crash
+def web_data_filter(_, __, message):
+    return bool(message.web_app_data)
+
+web_data = filters.create(web_data_filter)
+
+# --- 2. Start Command ---
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    # This URL must be your Koyeb/Heroku URL
     web_app_url = URL  
-    
+    if not web_app_url.startswith("http"):
+        await message.reply("⚠️ Error: `URL` Variable is missing or invalid in Koyeb.")
+        return
+
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n\n"
-        "Click the button below to open the **Movie Club App**! 🎬\n"
-        "Search movies, see posters, and download files instantly.",
+        "Click the button below to open the **Movie Club App**! 🎬\n",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 Open Movie App", web_app=WebAppInfo(url=web_app_url))],
             [InlineKeyboardButton("🔍 Inline Search", switch_inline_query_current_chat="")]
         ])
     )
 
-# 2. Handle Data Sent from Web App
-@app.on_message(filters.service & filters.web_app_data)
+# --- 3. Handle Web App Data (FIXED HANDLER) ---
+@app.on_message(web_data)
 async def web_app_data_handler(client, message):
     try:
         unique_id = message.web_app_data.data
         
-        # Get file from DB
         ref = db.reference(f'files/{unique_id}')
         file_data = ref.get()
         
@@ -251,7 +250,6 @@ async def web_app_data_handler(client, message):
             
         await message.reply(f"📂 **Retrieving:** `{file_data['file_name']}`...", quote=True)
         
-        # Send the file
         caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ Auto-delete in 2 mins."
         sent_msg = await client.send_cached_media(
             chat_id=message.chat.id,
@@ -259,17 +257,15 @@ async def web_app_data_handler(client, message):
             caption=caption
         )
         
-        # Schedule Delete
         asyncio.create_task(delete_after(sent_msg, 120))
         
-        # AUTO SEND START AGAIN (As requested)
-        await asyncio.sleep(1) # Small delay for UX
+        await asyncio.sleep(1) 
         await start(client, message)
         
     except Exception as e:
         logger.error(f"Web App Error: {e}")
 
-# 3. File Indexing (Same as before)
+# --- 4. File Indexing ---
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
     try:
@@ -292,10 +288,8 @@ async def index_files(client, message):
 
 # --- MAIN ENTRY POINT ---
 if __name__ == "__main__":
-    # Start Flask in background thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     
-    # Start Bot
     print("Bot & Web App Started...")
     app.run()
