@@ -10,7 +10,7 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageDeleteForbidden, UserNotParticipant
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -20,6 +20,7 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "0")
 MOVIE_CHANNEL = os.environ.get("MOVIE_CHANNEL", "")
+MOVIE_CHANNEL_LINK = os.environ.get("MOVIE_CHANNEL_LINK", "")
 JOIN_CHANNEL = os.environ.get("JOIN_CHANNEL", "")
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
@@ -32,6 +33,7 @@ print(f"API_HASH: {'Set' if API_HASH else 'NOT SET'}")
 print(f"BOT_TOKEN: {'Set' if BOT_TOKEN else 'NOT SET'}")
 print(f"CHANNEL_ID: {'Set' if CHANNEL_ID and CHANNEL_ID != '0' else 'NOT SET'}")
 print(f"MOVIE_CHANNEL: {'Set' if MOVIE_CHANNEL else 'NOT SET'}")
+print(f"MOVIE_CHANNEL_LINK: {'Set' if MOVIE_CHANNEL_LINK else 'NOT SET'}")
 print(f"JOIN_CHANNEL: {'Set' if JOIN_CHANNEL else 'NOT SET'}")
 print(f"DB_URL: {'Set' if DB_URL else 'NOT SET'}")
 print(f"FIREBASE_KEY: {'Set' if FIREBASE_KEY else 'NOT SET'}")
@@ -55,7 +57,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "status": "running",
                 "service": "BS Auto Filter Bot",
                 "timestamp": datetime.now().isoformat(),
-                "bot_status": "starting"
+                "features": ["search", "auto-delete", "channel-posting"]
             }
             self.wfile.write(json.dumps(status).encode())
         else:
@@ -97,10 +99,78 @@ def setup_firebase():
         print(f"❌ Firebase Error: {e}")
         return False
 
+# --- GLOBAL STORAGE ---
+USER_SEARCHES = {}
+RESULTS_PER_PAGE = 10
+DELETE_TASKS = {}
+MOVIE_POSTS = {}
+
+# --- HELPER FUNCTIONS ---
+def get_size(size):
+    if not size: return "0B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    return f"{size:.2f} {units[i]}"
+
+async def handle_flood_wait(e, operation="unknown"):
+    """Handle FloodWait errors"""
+    wait_time = e.value or 60
+    logger.warning(f"⏳ FloodWait for {operation}. Waiting {wait_time}s...")
+    print(f"⏳ FloodWait detected. Waiting {wait_time} seconds...")
+    await asyncio.sleep(wait_time)
+
+async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, message_type="file"):
+    """Delete a message after specified delay"""
+    try:
+        logger.info(f"⏰ Scheduled deletion for {message_type} message {message_id} in {delay_minutes} minutes")
+        await asyncio.sleep(delay_minutes * 60)
+        
+        try:
+            await bot.delete_messages(chat_id, message_id)
+            logger.info(f"🗑️ Deleted {message_type} message {message_id}")
+        except MessageDeleteForbidden:
+            logger.warning(f"⚠️ Cannot delete {message_type} message {message_id} - forbidden")
+        except Exception as e:
+            logger.error(f"❌ Error deleting {message_type} message {message_id}: {e}")
+        
+        # Remove task from tracking
+        task_key = f"{message_id}_{chat_id}"
+        if task_key in DELETE_TASKS:
+            del DELETE_TASKS[task_key]
+            
+    except asyncio.CancelledError:
+        logger.info(f"⏹️ Deletion cancelled for message {message_id}")
+    except Exception as e:
+        logger.error(f"❌ Error in delete_message_after_delay: {e}")
+
+async def check_user_in_channel(user_id):
+    """Check if user is member of required channel"""
+    try:
+        if not JOIN_CHANNEL or "t.me" not in JOIN_CHANNEL:
+            return True
+            
+        channel_username = JOIN_CHANNEL.split("/")[-1]
+        if not channel_username:
+            return True
+            
+        try:
+            user = await bot.get_chat_member(channel_username, user_id)
+            return user.status in ["member", "administrator", "creator"]
+        except UserNotParticipant:
+            return False
+        except Exception as e:
+            logger.error(f"Error checking channel membership: {e}")
+            return True
+    except Exception as e:
+        logger.error(f"Error in check_user_in_channel: {e}")
+        return True
+
 # --- CREATE BOT CLIENT ---
 def create_bot():
     try:
-        # Convert string IDs to integers
         api_id = int(API_ID) if API_ID and API_ID != "0" else None
         channel_id = int(CHANNEL_ID) if CHANNEL_ID and CHANNEL_ID != "0" else None
         
@@ -123,61 +193,324 @@ def create_bot():
         print(f"❌ Error creating bot: {e}")
         return None
 
+# --- SEARCH AND FILE FUNCTIONS ---
+async def send_results_page(message, editable_msg, page=1):
+    user_id = message.from_user.id
+    results = USER_SEARCHES.get(user_id)
+
+    if not results:
+        await editable_msg.edit("⚠️ Session expired.")
+        return
+
+    total_results = len(results)
+    total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
+    start_i = (page - 1) * RESULTS_PER_PAGE
+    current_files = results[start_i : start_i + RESULTS_PER_PAGE]
+
+    buttons = []
+    for file in current_files:
+        size = get_size(file.get('file_size', 0))
+        name = file.get('file_name', 'Unknown')
+        btn_name = name.replace("[", "").replace("]", "")
+        if len(btn_name) > 40: 
+            btn_name = btn_name[:40] + "..."
+        
+        buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"get|{file['unique_id']}")])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
+    if nav: 
+        buttons.append(nav)
+    
+    current_time = datetime.now().strftime("%H:%M")
+    
+    text = f"**Found {total_results} Files** 🎬\n" \
+           f"Click to get movie link:\n\n" \
+           f"⏰ **Auto-Delete:**\n" \
+           f"• Movie posts: 2 minutes\n" \
+           f"• This list: 10 minutes ({current_time})\n\n" \
+           f"*Search: {message.text}*"
+
+    await editable_msg.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def post_movie_to_channel(file_data, user_id):
+    """Post movie to channel and return message link"""
+    try:
+        if not MOVIE_CHANNEL:
+            logger.error("❌ MOVIE_CHANNEL not configured")
+            return None
+        
+        file_name = file_data.get('file_name', 'Unknown')
+        file_size = get_size(file_data.get('file_size', 0))
+        
+        caption = f"**🎬 {file_name}**\n\n" \
+                 f"📦 **Size:** {file_size}\n" \
+                 f"⏰ **Auto-deletes in 2 minutes**\n\n" \
+                 f"#BSAutoFilterBot"
+        
+        # Convert channel ID
+        channel_id = MOVIE_CHANNEL
+        if isinstance(MOVIE_CHANNEL, str):
+            if MOVIE_CHANNEL.startswith('@'):
+                channel_id = MOVIE_CHANNEL
+            elif MOVIE_CHANNEL.lstrip('-').isdigit():
+                channel_id = int(MOVIE_CHANNEL)
+        
+        # Post to movie channel
+        message = await bot.send_cached_media(
+            chat_id=channel_id,
+            file_id=file_data['file_id'],
+            caption=caption
+        )
+        
+        # Generate message link
+        if isinstance(channel_id, str) and channel_id.startswith('@'):
+            channel_username = channel_id.lstrip('@')
+            message_link = f"https://t.me/{channel_username}/{message.id}"
+        else:
+            channel_str = str(channel_id).replace('-100', '')
+            message_link = f"https://t.me/c/{channel_str}/{message.id}"
+        
+        # Schedule auto-delete in 2 minutes
+        task_key = f"{message.id}_{channel_id}"
+        delete_task = asyncio.create_task(
+            delete_message_after_delay(message.id, channel_id, 2, "channel_movie")
+        )
+        DELETE_TASKS[task_key] = delete_task
+        
+        return message_link
+        
+    except FloodWait as e:
+        await handle_flood_wait(e, "post_to_channel")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error posting to channel: {e}")
+        return None
+
 # --- BOT COMMAND HANDLERS ---
-def setup_handlers(bot):
+def setup_handlers(bot_instance):
     """Setup all bot command handlers"""
+    
+    # Store bot instance globally for use in other functions
+    global bot
+    bot = bot_instance
+    
+    @bot.on_message(filters.chat(int(CHANNEL_ID)) & (filters.document | filters.video) if CHANNEL_ID and CHANNEL_ID != "0" else filters.none)
+    async def index_files(client, message):
+        try:
+            media = message.document or message.video
+            if not media: 
+                return
+
+            filename = getattr(media, "file_name", None)
+            
+            if not filename:
+                if message.caption:
+                    filename = message.caption.split("\n")[0].strip()
+                    if message.video and not "." in filename:
+                        filename += ".mp4"
+                    elif message.document and not "." in filename:
+                        filename += ".mkv"
+                else:
+                    filename = f"Video_{message.id}.mp4"
+
+            valid_exts = ('.mkv', '.mp4', '.avi', '.webm', '.mov')
+            if not filename.lower().endswith(valid_exts) and not message.video:
+                return
+
+            file_data = {
+                "file_name": filename,
+                "file_size": media.file_size,
+                "file_id": media.file_id,
+                "unique_id": media.file_unique_id,
+                "message_id": message.id,
+                "channel_id": CHANNEL_ID,
+                "caption": message.caption or filename,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            ref = db.reference(f'files/{media.file_unique_id}')
+            ref.set(file_data)
+            
+            logger.info(f"✅ Indexed: {filename} (ID: {message.id})")
+            print(f"✅ Indexed file: {filename}")
+
+        except Exception as e:
+            logger.error(f"❌ Error indexing file: {e}")
     
     @bot.on_message(filters.command("start") & filters.private)
     async def start_command(client, message):
         print(f"📨 Received /start from {message.from_user.id}")
-        await message.reply_text(
-            f"👋 **Hey {message.from_user.first_name}!**\n"
-            f"Welcome to **BS Auto Filter Bot** 🎬\n\n"
-            f"Send me a movie name and I'll search for it."
-        )
-
+        start_text = f"👋 **Hey {message.from_user.first_name}!**\n" \
+                     f"Welcome to **BS Auto Filter Bot** 🎬\n\n" \
+                     f"Send me a movie name and I'll search for it.\n\n" \
+                     f"⚠️ **Auto-Delete Rules:**\n" \
+                     f"• Movie posts auto-delete in **2 minutes** ⏰\n" \
+                     f"• Search results auto-delete in **10 minutes** ⏰\n\n"
+        
+        if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
+            start_text += f"📢 **Required:** Join our channel to access movies!\n"
+        
+        await message.reply_text(start_text)
+    
     @bot.on_message(filters.command("ping") & filters.private)
     async def ping_command(client, message):
-        print(f"🏓 Received /ping from {message.from_user.id}")
         start_time = time.time()
         msg = await message.reply_text("🏓 Pong!")
         end_time = time.time()
         await msg.edit_text(f"🏓 Pong! `{round((end_time - start_time) * 1000, 2)}ms`")
-
+    
     @bot.on_message(filters.command("status") & filters.private)
     async def status_command(client, message):
-        print(f"📊 Received /status from {message.from_user.id}")
+        ref = db.reference('files')
+        snapshot = ref.get()
+        total_files = len(snapshot) if snapshot else 0
+        
         await message.reply_text(
             "**🤖 Bot Status:**\n"
-            "✅ Online and running\n"
+            f"✅ Online and running\n"
+            f"📊 Total files indexed: {total_files}\n"
             f"👤 User: {message.from_user.first_name}\n"
             f"🆔 ID: {message.from_user.id}\n"
             f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
         )
-
-    @bot.on_message(filters.command("id") & filters.private)
-    async def id_command(client, message):
-        print(f"🆔 Received /id from {message.from_user.id}")
-        await message.reply_text(
-            f"**Your Info:**\n"
-            f"👤 Name: {message.from_user.first_name}\n"
-            f"🆔 ID: `{message.from_user.id}`\n"
-            f"📝 Chat ID: `{message.chat.id}`"
-        )
-
+    
     @bot.on_message(filters.text & filters.private)
-    async def text_handler(client, message):
-        if message.text.startswith('/'):
+    async def search_handler(client, message):
+        query = message.text.strip().lower()
+        
+        if query.startswith('/'):
             return
-            
-        print(f"📝 Received text from {message.from_user.id}: {message.text[:50]}...")
-        await message.reply_text(
-            f"🔍 You sent: `{message.text}`\n\n"
-            f"✅ Bot is working! Search functionality will be added soon."
-        )
+        
+        # Check channel membership
+        if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
+            is_member = await check_user_in_channel(message.from_user.id)
+            if not is_member:
+                buttons = [[InlineKeyboardButton("🔗 Join Channel", url=JOIN_CHANNEL)]]
+                await message.reply_text(
+                    "⚠️ **Access Restricted!**\n\n"
+                    "You need to join our channel to use this bot.\n"
+                    "Please join the channel below and try again.",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+                return
+        
+        msg = await message.reply_text("⏳ **Searching...**")
 
-    print("✅ Bot handlers setup complete")
-    return bot
+        try:
+            ref = db.reference('files')
+            snapshot = ref.get()
+
+            if not snapshot:
+                await msg.edit("❌ Database is empty.")
+                return
+
+            results = []
+            for key, val in snapshot.items():
+                f_name = val.get('file_name', '').lower().replace(".", " ")
+                if query in f_name:
+                    results.append(val)
+            
+            if not results:
+                await msg.edit(f"❌ No results found for: `{query}`")
+                return
+
+            USER_SEARCHES[message.from_user.id] = results
+            
+            # Send results and schedule deletion in 10 minutes
+            await send_results_page(message, msg, page=1)
+            
+            # Schedule deletion of search results message in 10 minutes
+            if msg:
+                task_key = f"{msg.id}_{msg.chat.id}"
+                delete_task = asyncio.create_task(
+                    delete_message_after_delay(msg.id, msg.chat.id, 10, "search_results")
+                )
+                DELETE_TASKS[task_key] = delete_task
+
+        except Exception as e:
+            logger.error(f"Search Error: {e}")
+            await msg.edit("❌ Error occurred.")
+    
+    @bot.on_callback_query()
+    async def callback_handler(client, cb):
+        try:
+            data = cb.data.split("|")
+            action = data[0]
+
+            if action == "get":
+                unique_id = data[1]
+                ref = db.reference(f'files/{unique_id}')
+                file_data = ref.get()
+
+                if not file_data:
+                    await cb.answer("❌ File not found.", show_alert=True)
+                    return
+                
+                await cb.answer("📤 Posting to channel...")
+                
+                # Post movie to channel
+                message_link = await post_movie_to_channel(file_data, cb.from_user.id)
+                
+                if not message_link:
+                    await cb.answer("❌ Failed to post movie. Please try again.", show_alert=True)
+                    return
+                
+                # Prepare buttons
+                buttons = []
+                
+                if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
+                    buttons.append([InlineKeyboardButton("🔗 Join Channel", url=JOIN_CHANNEL)])
+                
+                buttons.append([InlineKeyboardButton("🎬 Movie Post Link", url=message_link)])
+                
+                # Send message with buttons to user
+                file_name = file_data.get('file_name', 'Unknown')
+                file_size = get_size(file_data.get('file_size', 0))
+                
+                user_msg = await cb.message.reply_text(
+                    f"✅ **Movie Posted Successfully!**\n\n"
+                    f"🎬 **Title:** {file_name}\n"
+                    f"📦 **Size:** {file_size}\n"
+                    f"⏰ **Auto-deletes in 2 minutes**\n\n"
+                    f"Click the button below to get the movie:",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+                
+                # Schedule deletion of user message in 5 minutes
+                task_key = f"{user_msg.id}_{user_msg.chat.id}"
+                delete_task = asyncio.create_task(
+                    delete_message_after_delay(user_msg.id, user_msg.chat.id, 5, "user_notification")
+                )
+                DELETE_TASKS[task_key] = delete_task
+
+            elif action == "page":
+                user_id = cb.from_user.id
+                results = USER_SEARCHES.get(user_id)
+                
+                if not results:
+                    await cb.answer("⚠️ Session expired. Search again.", show_alert=True)
+                    return
+                    
+                await send_results_page(cb, cb.message, page=int(data[1]))
+                await cb.answer(f"Page {data[1]}")
+                
+            elif action == "noop":
+                await cb.answer("Current page", show_alert=False)
+
+        except Exception as e:
+            logger.error(f"Callback Error: {e}")
+            await cb.answer("❌ Error occurred", show_alert=True)
+    
+    print("✅ All bot handlers setup complete")
+    return bot_instance
 
 # --- START BOT WITH RETRY ---
 async def start_bot():
@@ -189,20 +522,20 @@ async def start_bot():
             print(f"\n🚀 Starting bot (Attempt {attempt + 1}/{max_retries})...")
             
             # Create bot instance
-            bot = create_bot()
-            if not bot:
+            bot_instance = create_bot()
+            if not bot_instance:
                 print("❌ Failed to create bot instance")
                 return None
             
             # Setup handlers
-            bot = setup_handlers(bot)
+            bot_instance = setup_handlers(bot_instance)
             
             # Start the bot
-            await bot.start()
+            await bot_instance.start()
             print("✅ Bot started successfully!")
             
             # Get bot info
-            me = await bot.get_me()
+            me = await bot_instance.get_me()
             print(f"🤖 Bot Info:")
             print(f"   Name: {me.first_name}")
             print(f"   Username: @{me.username}")
@@ -210,18 +543,22 @@ async def start_bot():
             
             # Send startup notification
             try:
-                await bot.send_message(
+                await bot_instance.send_message(
                     chat_id=me.id,
                     text=f"🤖 **Bot Started Successfully!**\n\n"
                          f"Name: {me.first_name}\n"
                          f"Username: @{me.username}\n"
                          f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                         f"✅ Ready to receive commands!"
+                         f"✅ Features ready:\n"
+                         f"• File indexing\n"
+                         f"• Movie search\n"
+                         f"• Channel posting\n"
+                         f"• Auto-delete system"
                 )
             except Exception as e:
                 print(f"⚠️ Could not send startup message: {e}")
             
-            return bot
+            return bot_instance
             
         except FloodWait as e:
             wait_time = e.value or 60
@@ -238,44 +575,56 @@ async def start_bot():
             if attempt < max_retries - 1:
                 print(f"💤 Waiting {retry_delay} seconds before retry...")
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2
             else:
                 print(f"❌ Max retries reached.")
                 return None
     
     return None
 
+async def cancel_all_delete_tasks():
+    """Cancel all pending delete tasks"""
+    print("🗑️ Cancelling all pending delete tasks...")
+    for task_key, task in list(DELETE_TASKS.items()):
+        try:
+            task.cancel()
+        except:
+            pass
+    DELETE_TASKS.clear()
+
 async def run_bot():
     """Main bot runner"""
     print("\n" + "="*50)
-    print("BS AUTO FILTER BOT - STARTING")
+    print("BS AUTO FILTER BOT - COMPLETE VERSION")
     print("="*50)
     
     # Setup Firebase
     firebase_setup = setup_firebase()
     
     # Start bot
-    bot = await start_bot()
+    bot_instance = await start_bot()
     
-    if bot:
+    if bot_instance:
         print("\n" + "="*50)
-        print("✅ BOT IS RUNNING SUCCESSFULLY!")
+        print("✅ BOT IS RUNNING WITH ALL FEATURES!")
         print("="*50)
-        print("\n📱 Available Commands:")
-        print("   /start - Start the bot")
-        print("   /ping - Test bot response")
-        print("   /status - Check bot status")
-        print("   /id - Get your user ID")
-        print("\n🌐 Health check available at:")
-        print("   http://localhost:8080/")
-        print("   http://localhost:8080/health")
-        print("   http://localhost:8080/status")
-        print("\n⏰ Time:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print("\n🎯 Available Features:")
+        print("   1. File indexing from channel")
+        print("   2. Movie search by name")
+        print("   3. Post movies to movie channel")
+        print("   4. Auto-delete system:")
+        print("      • Movie posts: 2 minutes")
+        print("      • Search results: 10 minutes")
+        print("      • User notifications: 5 minutes")
+        print("   5. Channel join requirement")
+        print("   6. Two buttons: Join Channel + Movie Link")
+        print("\n📱 Commands: /start, /ping, /status")
+        print("\n🌐 Health check: http://localhost:8080/")
+        print("⏰ Time:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         print("="*50)
         
-        # Keep the bot running
         try:
-            # Run forever
+            # Keep bot running
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             print("\n🛑 Received shutdown signal...")
@@ -283,19 +632,19 @@ async def run_bot():
             print(f"\n⚠️ Error in main loop: {e}")
         finally:
             # Clean shutdown
-            if bot:
-                print("🛑 Stopping bot...")
-                await bot.stop()
+            print("🛑 Stopping bot...")
+            await cancel_all_delete_tasks()
+            if bot_instance:
+                await bot_instance.stop()
                 print("✅ Bot stopped cleanly")
     else:
         print("\n❌ FAILED TO START BOT")
         print("="*50)
-        print("Please check:")
-        print("1. ✅ Environment variables are set")
-        print("2. 🔑 Bot token is valid (check with @BotFather)")
-        print("3. 🌐 Internet connectivity")
-        print("4. ⏰ Wait if there's FloodWait restriction")
-        print("5. 🔄 Restart the app after fixing issues")
+        print("Troubleshooting:")
+        print("1. Check all environment variables")
+        print("2. Verify bot token with @BotFather")
+        print("3. Wait if FloodWait restriction")
+        print("4. Ensure bot has access to channels")
         print("="*50)
     
     print("👋 Bot process ended")
@@ -311,14 +660,11 @@ def main():
     time.sleep(2)
     
     # Start the bot
-    print("🚀 Starting Telegram bot...")
+    print("🚀 Starting Telegram bot with all features...")
     
     try:
-        # Create event loop and run bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        # Run the bot
         loop.run_until_complete(run_bot())
         
     except KeyboardInterrupt:
@@ -331,12 +677,13 @@ def main():
         print("👋 Application ended")
 
 if __name__ == "__main__":
-    # Check if we should run in simple mode (without full features)
+    # Initialize bot variable
+    bot = None
+    
+    # Check required environment variables
     if not all([API_ID, API_HASH, BOT_TOKEN]):
         print("⚠️ WARNING: Missing required environment variables!")
         print("Running in minimal mode with only HTTP server...")
-        
-        # Just run HTTP server
         run_http_server()
     else:
         main()
