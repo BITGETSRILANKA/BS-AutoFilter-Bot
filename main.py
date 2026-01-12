@@ -50,7 +50,6 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        # Suppress the default logging
         pass
 
 def run_http_server():
@@ -70,7 +69,6 @@ app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_
 # --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
 RESULTS_PER_PAGE = 10
-# Store scheduled delete tasks
 DELETE_TASKS = {}
 
 # --- HELPER: Size ---
@@ -85,12 +83,10 @@ def get_size(size):
 
 # --- AUTO DELETE FUNCTION ---
 async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, message_type="file"):
-    """Delete a message after specified delay"""
     try:
         logger.info(f"⏰ Scheduled deletion for {message_type} message {message_id} in {delay_minutes} minutes")
-        await asyncio.sleep(delay_minutes * 60)  # Convert minutes to seconds
+        await asyncio.sleep(delay_minutes * 60)
         
-        # Try to delete the message
         try:
             await app.delete_messages(chat_id, message_id)
             logger.info(f"🗑️ Deleted {message_type} message {message_id}")
@@ -99,7 +95,6 @@ async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, messa
         except Exception as e:
             logger.error(f"❌ Error deleting {message_type} message {message_id}: {e}")
         
-        # Remove task from tracking
         task_key = f"{message_id}_{chat_id}"
         if task_key in DELETE_TASKS:
             del DELETE_TASKS[task_key]
@@ -110,7 +105,7 @@ async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, messa
         logger.error(f"❌ Error in delete_message_after_delay: {e}")
 
 # -----------------------------------------------------------------------------
-# 1. SMARTER FILE INDEXING (Fixes the "Row/Album" Issue)
+# 1. SMARTER FILE INDEXING
 # -----------------------------------------------------------------------------
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
@@ -118,40 +113,30 @@ async def index_files(client, message):
         media = message.document or message.video
         if not media: return
 
-        # --- LOGIC TO FIX MISSING FILENAMES IN ALBUMS ---
         filename = getattr(media, "file_name", None)
         
-        # 1. If filename is missing, try to use the caption
         if not filename:
             if message.caption:
-                # Use first line of caption as filename
                 filename = message.caption.split("\n")[0].strip()
-                # Append extension if missing
                 if message.video and not "." in filename:
                     filename += ".mp4"
                 elif message.document and not "." in filename:
                     filename += ".mkv"
             else:
-                # 2. If no caption, generate a name (so it still saves)
                 filename = f"Video_{message.id}.mp4"
 
-        # Validate Extension (Relaxed for Videos)
         valid_exts = ('.mkv', '.mp4', '.avi', '.webm', '.mov')
         if not filename.lower().endswith(valid_exts) and not message.video:
-            # If it's a document but not a video file, ignore it
             return
 
-        # Prepare Data
         file_data = {
             "file_name": filename,
             "file_size": media.file_size,
             "file_id": media.file_id,
             "unique_id": media.file_unique_id,
-            "caption": message.caption or filename # Use filename as caption if caption is empty
+            "caption": message.caption or filename
         }
 
-        # Save to Firebase
-        # We use unique_id to prevent duplicates (Same file = Same ID)
         ref = db.reference(f'files/{media.file_unique_id}')
         ref.set(file_data)
         
@@ -209,7 +194,6 @@ async def rules_command(client, message):
 async def search_handler(client, message):
     query = message.text.strip().lower()
     
-    # Skip commands
     if query.startswith('/'):
         return
         
@@ -225,7 +209,6 @@ async def search_handler(client, message):
 
         results = []
         for key, val in snapshot.items():
-            # Search Logic: Check if query exists in filename
             f_name = val.get('file_name', '').lower().replace(".", " ")
             if query in f_name:
                 results.append(val)
@@ -234,12 +217,14 @@ async def search_handler(client, message):
             await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        USER_SEARCHES[message.from_user.id] = results
+        # FIXED: Store query along with results
+        USER_SEARCHES[message.from_user.id] = {
+            "query": message.text,
+            "results": results
+        }
         
-        # Send results and schedule deletion in 10 minutes
         await send_results_page(message, msg, page=1)
         
-        # Schedule deletion of search results message in 10 minutes
         if msg:
             task_key = f"{msg.id}_{msg.chat.id}"
             delete_task = asyncio.create_task(
@@ -256,11 +241,17 @@ async def search_handler(client, message):
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1):
     user_id = message.from_user.id
-    results = USER_SEARCHES.get(user_id)
+    
+    # FIXED: Retrieve dictionary containing results and query
+    user_data = USER_SEARCHES.get(user_id)
 
-    if not results:
+    if not user_data:
         await editable_msg.edit("⚠️ Session expired.")
         return
+
+    # Extract results and the original query string
+    results = user_data["results"]
+    search_query = user_data["query"]
 
     total_results = len(results)
     total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
@@ -271,7 +262,6 @@ async def send_results_page(message, editable_msg, page=1):
     for file in current_files:
         size = get_size(file.get('file_size', 0))
         name = file.get('file_name', 'Unknown')
-        # Cleanup name for button
         btn_name = name.replace("[", "").replace("]", "")
         if len(btn_name) > 40: btn_name = btn_name[:40] + "..."
         
@@ -285,15 +275,15 @@ async def send_results_page(message, editable_msg, page=1):
         nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
     if nav: buttons.append(nav)
     
-    # Add auto-delete info in message
     current_time = datetime.now().strftime("%H:%M")
     
+    # FIXED: Use stored search_query instead of message.text
     text = f"**Found {total_results} Files** 🎬\n" \
            f"Click to download:\n\n" \
            f"⏰ **Auto-Delete:**\n" \
            f"• Files: 2 minutes after download\n" \
            f"• This list: 10 minutes ({current_time})\n\n" \
-           f"*Search: {message.text}*"
+           f"*Search: {search_query}*"
 
     await editable_msg.edit_text(
         text,
@@ -301,7 +291,7 @@ async def send_results_page(message, editable_msg, page=1):
     )
 
 # -----------------------------------------------------------------------------
-# 4. CALLBACKS - SEND FILE WITH 2-MINUTE AUTO DELETE
+# 4. CALLBACKS
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -320,7 +310,6 @@ async def callback_handler(client, cb):
             
             await cb.answer("📂 Sending...")
             
-            # Send file with caption showing auto-delete warning
             file_name = file_data.get('file_name', 'Unknown')
             caption = f"**{file_name}**\n\n" \
                      f"⏰ **Auto-delete in 2 minutes**\n" \
@@ -332,7 +321,6 @@ async def callback_handler(client, cb):
                 caption=caption
             )
             
-            # Schedule deletion after 2 minutes
             if sent_message:
                 task_key = f"{sent_message.id}_{sent_message.chat.id}"
                 delete_task = asyncio.create_task(
@@ -340,14 +328,12 @@ async def callback_handler(client, cb):
                 )
                 DELETE_TASKS[task_key] = delete_task
                 
-                # Send a quick reminder (auto-deletes in 1 minute)
                 reminder = await cb.message.reply_text(
                     f"⏰ **Reminder:** `{file_name}`\n"
                     f"Will auto-delete in 2 minutes!",
                     quote=False
                 )
                 
-                # Also schedule deletion of the reminder message in 1 minute
                 reminder_key = f"{reminder.id}_{reminder.chat.id}"
                 reminder_task = asyncio.create_task(
                     delete_message_after_delay(reminder.id, cb.message.chat.id, 1, "reminder")
@@ -355,12 +341,11 @@ async def callback_handler(client, cb):
                 DELETE_TASKS[reminder_key] = reminder_task
 
         elif action == "page":
-            # When user navigates to different page, update the message
-            # but keep the 10-minute deletion schedule
             user_id = cb.from_user.id
-            results = USER_SEARCHES.get(user_id)
+            # Note: We now check the dictionary wrapper
+            user_data = USER_SEARCHES.get(user_id)
             
-            if not results:
+            if not user_data:
                 await cb.answer("⚠️ Session expired. Search again.")
                 return
                 
@@ -374,10 +359,9 @@ async def callback_handler(client, cb):
         logger.error(f"Callback Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 5. CANCEL ALL PENDING DELETE TASKS ON STOP
+# 5. CANCEL TASKS & MAIN
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
-    """Cancel all pending delete tasks when bot stops"""
     logger.info("Cancelling all pending delete tasks...")
     for task_key, task in list(DELETE_TASKS.items()):
         try:
@@ -387,29 +371,17 @@ async def cancel_all_delete_tasks():
             pass
     DELETE_TASKS.clear()
 
-# -----------------------------------------------------------------------------
-# 6. BOT STARTUP AND SHUTDOWN HANDLERS
-# -----------------------------------------------------------------------------
-@app.on_raw_update()
-async def handle_raw_update(client, update, users, chats):
-    # This handles bot startup/shutdown
-    pass
-
 def main():
-    # Start HTTP server in a separate thread for Koyeb health checks
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
     
-    # Start the Telegram bot
     print("BS Auto Filter Bot Started...")
     
-    # Setup signal handlers for clean shutdown
     try:
         app.run()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     finally:
-        # Cancel all pending tasks on exit
         asyncio.run(cancel_all_delete_tasks())
 
 if __name__ == "__main__":
