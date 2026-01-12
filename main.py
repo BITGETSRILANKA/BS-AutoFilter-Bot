@@ -7,8 +7,6 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 import firebase_admin
 from firebase_admin import credentials, db
-
-# IMPORT FLASK SERVER
 from app import run_flask_server
 
 # --- CONFIG ---
@@ -18,13 +16,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
-URL = os.environ.get("URL", "") # Koyeb URL
+URL = os.environ.get("URL", "") # Your Koyeb URL
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("BSAutoFilterBot")
 
-# --- FIREBASE INIT (Double Check for Bot Thread) ---
+# --- FIREBASE INIT ---
 if not firebase_admin._apps:
     try:
         cred = credentials.Certificate(json.loads(FIREBASE_KEY))
@@ -35,14 +33,12 @@ if not firebase_admin._apps:
 # --- BOT SETUP ---
 app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- FILTERS ---
-# Custom filter for Web App Data (Fixes version issues)
+# --- WEB DATA FILTER ---
 def web_data_filter(_, __, message):
     return bool(message.web_app_data)
 web_data = filters.create(web_data_filter)
 
 # --- HANDLERS ---
-
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     if not URL.startswith("http"):
@@ -61,8 +57,6 @@ async def start(client, message):
 async def web_app_data_handler(client, message):
     try:
         unique_id = message.web_app_data.data
-        
-        # Fetch file info
         ref = db.reference(f'files/{unique_id}')
         file_data = ref.get()
         
@@ -72,17 +66,14 @@ async def web_app_data_handler(client, message):
             
         await message.reply(f"⬇️ **Sending:** `{file_data['file_name']}`...", quote=True)
         
-        caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ This file will auto-delete in 2 minutes."
+        caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ **Auto-delete in 2 mins.**"
         sent = await client.send_cached_media(
             chat_id=message.chat.id,
             file_id=file_data['file_id'],
             caption=caption
         )
         
-        # Schedule Auto-Delete (2 Mins)
         asyncio.create_task(delete_later(sent, 120))
-        
-        # Resend Start Menu
         await asyncio.sleep(1)
         await start(client, message)
         
@@ -102,12 +93,10 @@ async def index_files(client, message):
         media = message.document or message.video
         if not media: return
         
-        # Name Logic
         filename = getattr(media, "file_name", None)
         if not filename:
              filename = message.caption.split("\n")[0].strip() if message.caption else f"Video_{message.id}.mp4"
 
-        # Save to DB
         data = {
             "file_name": filename,
             "file_size": media.file_size,
@@ -116,15 +105,10 @@ async def index_files(client, message):
         }
         db.reference(f'files/{media.file_unique_id}').set(data)
         logger.info(f"Indexed: {filename}")
-        
     except Exception as e:
         logger.error(e)
 
 if __name__ == "__main__":
-    # Start Flask in Background
     t = threading.Thread(target=run_flask_server, daemon=True)
     t.start()
-    
-    # Start Bot
-    print("🚀 Bot and Web App Started...")
     app.run()
