@@ -1,6 +1,5 @@
 import os
 import logging
-import requests
 import json
 from flask import Flask, render_template_string, request, jsonify
 import firebase_admin
@@ -12,12 +11,13 @@ DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # --- FIREBASE INIT ---
+# We check if firebase is already initialized to avoid conflicts with main.py
 if not firebase_admin._apps and FIREBASE_KEY:
     try:
         cred = credentials.Certificate(json.loads(FIREBASE_KEY))
         firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
     except Exception as e:
-        print(f"Firebase Error: {e}")
+        print(f"Firebase Error in App: {e}")
 
 app_web = Flask(__name__)
 
@@ -366,4 +366,78 @@ HTML_TEMPLATE = """
         const res = await fetch(`/api/search_db?query=${encodeURIComponent(query)}`);
         const files = await res.json();
         
-        document.getElementById('fileCo
+        document.getElementById('fileCount').innerText = `(${files.length})`;
+        listDiv.innerHTML = '';
+
+        if (files.length === 0) {
+            listDiv.innerHTML = '<p style="text-align:center; color:#999; margin-top:20px;">No files available yet.</p>';
+            return;
+        }
+
+        files.forEach(f => {
+            // Quality Detection for Badge
+            let badgeClass = 'res-sd';
+            let badgeText = 'SD';
+            const name = f.file_name.toLowerCase();
+            
+            if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'res-4k'; badgeText = '2160p'; }
+            else if (name.includes('1080p')) { badgeClass = 'res-1080'; badgeText = '1080p'; }
+            else if (name.includes('720p')) { badgeClass = 'res-720'; badgeText = '720p'; }
+
+            // Size Formatting
+            let size = (f.file_size / (1024*1024)).toFixed(0) + ' MB';
+            if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
+
+            const div = document.createElement('div');
+            div.className = 'file-card';
+            div.onclick = () => tg.sendData(f.unique_id);
+            div.innerHTML = `
+                <div class="file-icon"><i class="fas fa-film"></i></div>
+                <div class="file-details">
+                    <div class="file-name">${f.file_name}</div>
+                    <div class="file-meta">
+                        <span>Size: ${size}</span>
+                        <span><i class="fas fa-download"></i> 0</span>
+                    </div>
+                </div>
+                <div class="res-badge ${badgeClass}">${badgeText}</div>
+            `;
+            listDiv.appendChild(div);
+        });
+    }
+</script>
+</body>
+</html>
+"""
+
+@app_web.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE, tmdb_key=TMDB_API_KEY)
+
+@app_web.route('/health')
+def health():
+    return "OK", 200
+
+@app_web.route('/api/search_db')
+def search_db():
+    query = request.args.get('query', '').lower().strip()
+    if not query: return jsonify([])
+    
+    # Simplify query for better matching (remove year, symbols)
+    simple_query = "".join(e for e in query if e.isalnum()).lower()[:10]
+
+    ref = db.reference('files')
+    snapshot = ref.get()
+    
+    results = []
+    if snapshot:
+        for key, val in snapshot.items():
+            file_n = val.get('file_name', '').lower().replace(".", " ")
+            if query in file_n:
+                results.append(val)
+    
+    return jsonify(results[:50])
+
+def run_flask_server():
+    port = int(os.environ.get('PORT', 8080))
+    app_web.run(host='0.0.0.0', port=port)
