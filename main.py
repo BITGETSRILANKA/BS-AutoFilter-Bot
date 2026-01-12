@@ -2,19 +2,19 @@ import os
 import json
 import math
 import logging
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import firebase_admin
 from firebase_admin import credentials, db
 
 # --- CONFIGURATION ---
-# These are loaded from Koyeb Environment Variables
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0)) 
-DB_URL = os.environ.get("DB_URL", "") 
-FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") 
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
+DB_URL = os.environ.get("DB_URL", "")
+FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -24,25 +24,23 @@ logger = logging.getLogger("MnSearchBot")
 if not firebase_admin._apps:
     try:
         if FIREBASE_KEY:
-            # Parse the JSON string from Env Var
             cred_dict = json.loads(FIREBASE_KEY)
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
             logger.info("✅ Firebase Initialized Successfully")
         else:
-            logger.error("❌ FIREBASE_KEY is missing in Env Vars")
+            logger.error("❌ FIREBASE_KEY is missing")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Firebase: {e}")
+        logger.error(f"❌ Firebase Error: {e}")
 
 # --- SETUP BOT ---
 app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- GLOBAL STORAGE (For Pagination) ---
-# Format: { user_id: [list_of_files] }
+# --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
 RESULTS_PER_PAGE = 10
 
-# --- HELPER: Human Readable Size ---
+# --- HELPER: Size ---
 def get_size(size):
     if not size: return "0B"
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -53,7 +51,7 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 # -----------------------------------------------------------------------------
-# 1. INDEX FILES (Auto-Save from Channel)
+# 1. SMARTER FILE INDEXING (Fixes the "Row/Album" Issue)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
@@ -61,131 +59,133 @@ async def index_files(client, message):
         media = message.document or message.video
         if not media: return
 
-        # Validate Extension
+        # --- LOGIC TO FIX MISSING FILENAMES IN ALBUMS ---
+        filename = getattr(media, "file_name", None)
+        
+        # 1. If filename is missing, try to use the caption
+        if not filename:
+            if message.caption:
+                # Use first line of caption as filename
+                filename = message.caption.split("\n")[0].strip()
+                # Append extension if missing
+                if message.video and not "." in filename:
+                    filename += ".mp4"
+                elif message.document and not "." in filename:
+                    filename += ".mkv"
+            else:
+                # 2. If no caption, generate a name (so it still saves)
+                filename = f"Video_{message.id}.mp4"
+
+        # Replace dots with spaces for better search (optional)
+        # filename = filename.replace(".", " ")
+
+        # Validate Extension (Relaxed for Videos)
         valid_exts = ('.mkv', '.mp4', '.avi', '.webm', '.mov')
-        fname = media.file_name or "Unknown_File"
-        if not fname.lower().endswith(valid_exts):
+        if not filename.lower().endswith(valid_exts) and not message.video:
+            # If it's a document but not a video file, ignore it
             return
 
         # Prepare Data
-        # Using file_unique_id as key prevents duplicates
         file_data = {
-            "file_name": fname,
+            "file_name": filename,
             "file_size": media.file_size,
             "file_id": media.file_id,
             "unique_id": media.file_unique_id,
-            "caption": message.caption or ""
+            "caption": message.caption or filename # Use filename as caption if caption is empty
         }
 
         # Save to Firebase
+        # We use unique_id to prevent duplicates (Same file = Same ID)
         ref = db.reference(f'files/{media.file_unique_id}')
         ref.set(file_data)
-        logger.info(f"💾 Indexed: {fname}")
+        
+        logger.info(f"✅ Indexed: {filename} (ID: {message.id})")
 
     except Exception as e:
-        logger.error(f"Error indexing: {e}")
+        logger.error(f"❌ Error indexing file: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. START COMMAND
+# 2. COMMANDS & SEARCH
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     await message.reply_text(
-        f"👋 **Hello {message.from_user.first_name}!**\n\n"
-        "I am a Movie Search Bot connected to Firebase.\n"
-        "Send me a movie name to search."
+        f"👋 **Hey {message.from_user.first_name}!**\n"
+        "Send me a movie name and I'll search for it."
     )
 
-# -----------------------------------------------------------------------------
-# 3. SEARCH LOGIC
-# -----------------------------------------------------------------------------
 @app.on_message(filters.text & filters.private)
 async def search_handler(client, message):
     query = message.text.strip().lower()
-    if query.startswith("/"): return
-
-    msg = await message.reply_text("🔎 **Searching database...**")
+    msg = await message.reply_text("⏳ **Searching...**")
 
     try:
-        # Fetch all data (For large DBs, consider Firebase Querying methods)
         ref = db.reference('files')
         snapshot = ref.get()
 
         if not snapshot:
-            await msg.edit("❌ **Database is empty.**")
+            await msg.edit("❌ Database is empty.")
             return
 
-        # Filter Results locally
         results = []
         for key, val in snapshot.items():
-            if val.get('file_name') and query in val['file_name'].lower().replace(".", " "):
+            # Search Logic: Check if query exists in filename
+            f_name = val.get('file_name', '').lower().replace(".", " ")
+            if query in f_name:
                 results.append(val)
         
         if not results:
-            await msg.edit(f"❌ No results found for: `{message.text}`")
+            await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        # Save results to memory for pagination
         USER_SEARCHES[message.from_user.id] = results
-        
-        # Send Page 1
         await send_results_page(message, msg, page=1)
 
     except Exception as e:
         logger.error(f"Search Error: {e}")
-        await msg.edit("❌ Error occurred while searching.")
+        await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. PAGINATION & BUTTON BUILDER
+# 3. PAGINATION
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1):
     user_id = message.from_user.id
     results = USER_SEARCHES.get(user_id)
 
     if not results:
-        await editable_msg.edit("⚠️ Session expired. Please search again.")
+        await editable_msg.edit("⚠️ Session expired.")
         return
 
     total_results = len(results)
     total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
-    
-    # Slice list for current page
     start_i = (page - 1) * RESULTS_PER_PAGE
-    end_i = start_i + RESULTS_PER_PAGE
-    current_files = results[start_i:end_i]
+    current_files = results[start_i : start_i + RESULTS_PER_PAGE]
 
-    # Build File Buttons
     buttons = []
     for file in current_files:
-        size = get_size(file['file_size'])
-        # Clean name for button
-        name = file['file_name'].replace("[", "").replace("]", "")
-        if len(name) > 40: name = name[:40] + "..."
+        size = get_size(file.get('file_size', 0))
+        name = file.get('file_name', 'Unknown')
+        # Cleanup name for button
+        btn_name = name.replace("[", "").replace("]", "")
+        if len(btn_name) > 40: btn_name = btn_name[:40] + "..."
         
-        btn_text = f"[{size}] {name}"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"dl|{file['unique_id']}")])
+        buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"dl|{file['unique_id']}")])
 
-    # Build Navigation Buttons
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
-    
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    
     if page < total_pages:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
-    
     if nav: buttons.append(nav)
 
     await editable_msg.edit_text(
-        f"👋 **Results for your search**\n"
-        f"Found {total_results} files.\n"
-        f"👇 Click to download:",
+        f"🎬 **Found {total_results} Files**\n👇 Click to download:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # -----------------------------------------------------------------------------
-# 5. CALLBACK HANDLER
+# 4. CALLBACKS
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -199,11 +199,10 @@ async def callback_handler(client, cb):
             file_data = ref.get()
 
             if not file_data:
-                await cb.answer("❌ File not found in DB", show_alert=True)
+                await cb.answer("❌ File not found.", show_alert=True)
                 return
             
-            await cb.answer("📂 Sending File...")
-            # Send Cached Media (Fast)
+            await cb.answer("📂 Sending...")
             await client.send_cached_media(
                 chat_id=cb.message.chat.id,
                 file_id=file_data['file_id'],
@@ -211,9 +210,7 @@ async def callback_handler(client, cb):
             )
 
         elif action == "page":
-            page_no = int(data[1])
-            await send_results_page(cb, cb.message, page=page_no)
-
+            await send_results_page(cb, cb.message, page=int(data[1]))
         elif action == "noop":
             await cb.answer("Current Page")
 
@@ -221,5 +218,5 @@ async def callback_handler(client, cb):
         logger.error(f"Callback Error: {e}")
 
 if __name__ == "__main__":
-    print("🤖 Bot Started...")
+    print("Bot Started...")
     app.run()
