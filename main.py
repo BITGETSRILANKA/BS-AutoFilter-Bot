@@ -4,11 +4,12 @@ import math
 import logging
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import MessageDeleteForbidden, UserNotParticipant
+from pyrogram.errors import MessageDeleteForbidden, UserNotParticipant, FloodWait
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -22,9 +23,13 @@ MOVIE_CHANNEL_LINK = os.environ.get("MOVIE_CHANNEL_LINK", "https://t.me/your_cha
 JOIN_CHANNEL = os.environ.get("JOIN_CHANNEL", "https://t.me/your_join_channel")  # Channel to join
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")  # Optional: For persistent session
 
 # --- SETUP LOGGING ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("BSAutoFilterBot")
 
 # --- SETUP FIREBASE ---
@@ -67,8 +72,20 @@ def run_http_server():
     finally:
         server.server_close()
 
-# --- SETUP BOT ---
-app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- SETUP BOT WITH FLOOD WAIT HANDLING ---
+def create_client():
+    """Create Pyrogram client with proper configuration"""
+    return Client(
+        name="BSAutoFilterBot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        workdir="./sessions",  # Store session files locally
+        sleep_threshold=30,  # Increased sleep threshold
+        max_concurrent_transmissions=1  # Reduce concurrent requests
+    )
+
+app = create_client()
 
 # --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
@@ -77,6 +94,8 @@ RESULTS_PER_PAGE = 10
 DELETE_TASKS = {}
 # Store movie posts in channel
 MOVIE_POSTS = {}
+# Store flood wait retry attempts
+FLOOD_RETRIES = {}
 
 # --- HELPER: Size ---
 def get_size(size):
@@ -88,6 +107,23 @@ def get_size(size):
         i += 1
     return f"{size:.2f} {units[i]}"
 
+# --- FLOOD WAIT HANDLER ---
+async def handle_flood_wait(e, operation="unknown"):
+    """Handle FloodWait errors with exponential backoff"""
+    wait_time = e.value or 60  # Default to 60 seconds if not specified
+    logger.warning(f"⏳ FloodWait detected for {operation}. Waiting {wait_time} seconds...")
+    
+    # Get retry count for this operation
+    retry_count = FLOOD_RETRIES.get(operation, 0) + 1
+    FLOOD_RETRIES[operation] = retry_count
+    
+    # Exponential backoff with jitter
+    backoff_time = min(wait_time * (1.5 ** retry_count), 300)  # Max 5 minutes
+    backoff_time += random.uniform(1, 5)  # Add jitter
+    
+    logger.info(f"Retry {retry_count} for {operation}, backoff: {backoff_time:.1f}s")
+    await asyncio.sleep(backoff_time)
+
 # --- AUTO DELETE FUNCTION ---
 async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, message_type="file"):
     """Delete a message after specified delay"""
@@ -95,10 +131,18 @@ async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, messa
         logger.info(f"⏰ Scheduled deletion for {message_type} message {message_id} in {delay_minutes} minutes")
         await asyncio.sleep(delay_minutes * 60)  # Convert minutes to seconds
         
-        # Try to delete the message
+        # Try to delete the message with flood wait handling
         try:
             await app.delete_messages(chat_id, message_id)
             logger.info(f"🗑️ Deleted {message_type} message {message_id}")
+        except FloodWait as e:
+            await handle_flood_wait(e, f"delete_message_{message_id}")
+            # Retry once
+            try:
+                await app.delete_messages(chat_id, message_id)
+                logger.info(f"🗑️ Deleted {message_type} message {message_id} after retry")
+            except Exception as e2:
+                logger.error(f"❌ Error deleting message {message_id} after retry: {e2}")
         except MessageDeleteForbidden:
             logger.warning(f"⚠️ Cannot delete {message_type} message {message_id} - forbidden")
         except Exception as e:
@@ -125,11 +169,20 @@ async def check_user_in_channel(user_id):
         channel_username = JOIN_CHANNEL.split("/")[-1]
         if not channel_username:
             return True
-            
-        # Check if user is member
+        
+        # Check if user is member with flood wait handling
         try:
             user = await app.get_chat_member(channel_username, user_id)
             return user.status in ["member", "administrator", "creator"]
+        except FloodWait as e:
+            await handle_flood_wait(e, "check_user_membership")
+            # Retry once
+            try:
+                user = await app.get_chat_member(channel_username, user_id)
+                return user.status in ["member", "administrator", "creator"]
+            except Exception as e2:
+                logger.error(f"Error checking channel membership after retry: {e2}")
+                return True  # Allow access on error
         except UserNotParticipant:
             return False
         except Exception as e:
@@ -340,62 +393,75 @@ async def send_results_page(message, editable_msg, page=1):
 # -----------------------------------------------------------------------------
 async def post_movie_to_channel(file_data, user_id):
     """Post movie to channel and return message link"""
-    try:
-        if not MOVIE_CHANNEL:
-            logger.error("❌ MOVIE_CHANNEL not configured")
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            if not MOVIE_CHANNEL:
+                logger.error("❌ MOVIE_CHANNEL not configured")
+                return None
+            
+            # Prepare caption for channel post
+            file_name = file_data.get('file_name', 'Unknown')
+            file_size = get_size(file_data.get('file_size', 0))
+            
+            caption = f"**🎬 {file_name}**\n\n" \
+                     f"📦 **Size:** {file_size}\n" \
+                     f"⏰ **Auto-deletes in 2 minutes**\n\n" \
+                     f"#BSAutoFilterBot"
+            
+            # Convert MOVIE_CHANNEL to appropriate format
+            channel_id = MOVIE_CHANNEL
+            if isinstance(MOVIE_CHANNEL, str):
+                if MOVIE_CHANNEL.startswith('@'):
+                    channel_id = MOVIE_CHANNEL
+                elif MOVIE_CHANNEL.lstrip('-').isdigit():
+                    channel_id = int(MOVIE_CHANNEL)
+            
+            # Post to movie channel with flood wait handling
+            message = await app.send_cached_media(
+                chat_id=channel_id,
+                file_id=file_data['file_id'],
+                caption=caption
+            )
+            
+            # Generate message link
+            if isinstance(channel_id, str) and channel_id.startswith('@'):
+                channel_username = channel_id.lstrip('@')
+                message_link = f"https://t.me/{channel_username}/{message.id}"
+            else:
+                # For private channels
+                channel_str = str(channel_id).replace('-100', '')
+                message_link = f"https://t.me/c/{channel_str}/{message.id}"
+            
+            # Store message info for auto-delete
+            MOVIE_POSTS[message.id] = {
+                'channel_id': channel_id,
+                'timestamp': datetime.now()
+            }
+            
+            # Schedule auto-delete in 2 minutes
+            task_key = f"{message.id}_{channel_id}"
+            delete_task = asyncio.create_task(
+                delete_message_after_delay(message.id, channel_id, 2, "channel_movie")
+            )
+            DELETE_TASKS[task_key] = delete_task
+            
+            return message_link
+            
+        except FloodWait as e:
+            retry_count += 1
+            logger.warning(f"⏳ FloodWait while posting to channel. Retry {retry_count}/{max_retries}")
+            await handle_flood_wait(e, "post_to_channel")
+            if retry_count == max_retries:
+                logger.error(f"❌ Failed to post to channel after {max_retries} retries")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error posting to channel: {e}")
             return None
-        
-        # Prepare caption for channel post
-        file_name = file_data.get('file_name', 'Unknown')
-        file_size = get_size(file_data.get('file_size', 0))
-        
-        caption = f"**🎬 {file_name}**\n\n" \
-                 f"📦 **Size:** {file_size}\n" \
-                 f"⏰ **Auto-deletes in 2 minutes**\n\n" \
-                 f"#BSAutoFilterBot"
-        
-        # Convert MOVIE_CHANNEL to appropriate format
-        channel_id = MOVIE_CHANNEL
-        if isinstance(MOVIE_CHANNEL, str):
-            if MOVIE_CHANNEL.startswith('@'):
-                channel_id = MOVIE_CHANNEL
-            elif MOVIE_CHANNEL.lstrip('-').isdigit():
-                channel_id = int(MOVIE_CHANNEL)
-        
-        # Post to movie channel
-        message = await app.send_cached_media(
-            chat_id=channel_id,
-            file_id=file_data['file_id'],
-            caption=caption
-        )
-        
-        # Generate message link
-        if isinstance(channel_id, str) and channel_id.startswith('@'):
-            channel_username = channel_id.lstrip('@')
-            message_link = f"https://t.me/{channel_username}/{message.id}"
-        else:
-            # For private channels
-            channel_str = str(channel_id).replace('-100', '')
-            message_link = f"https://t.me/c/{channel_str}/{message.id}"
-        
-        # Store message info for auto-delete
-        MOVIE_POSTS[message.id] = {
-            'channel_id': channel_id,
-            'timestamp': datetime.now()
-        }
-        
-        # Schedule auto-delete in 2 minutes
-        task_key = f"{message.id}_{channel_id}"
-        delete_task = asyncio.create_task(
-            delete_message_after_delay(message.id, channel_id, 2, "channel_movie")
-        )
-        DELETE_TASKS[task_key] = delete_task
-        
-        return message_link
-        
-    except Exception as e:
-        logger.error(f"❌ Error posting to channel: {e}")
-        return None
+    
+    return None
 
 # -----------------------------------------------------------------------------
 # 5. CALLBACKS - POST MOVIE TO CHANNEL AND SEND BUTTONS
@@ -421,7 +487,7 @@ async def callback_handler(client, cb):
             message_link = await post_movie_to_channel(file_data, cb.from_user.id)
             
             if not message_link:
-                await cb.answer("❌ Failed to post movie.", show_alert=True)
+                await cb.answer("❌ Failed to post movie. Please try again.", show_alert=True)
                 return
             
             # Prepare buttons
@@ -488,29 +554,86 @@ async def cancel_all_delete_tasks():
     DELETE_TASKS.clear()
 
 # -----------------------------------------------------------------------------
-# 7. BOT STARTUP AND SHUTDOWN HANDLERS
+# 7. BOT STARTUP WITH FLOOD WAIT HANDLING
 # -----------------------------------------------------------------------------
-@app.on_raw_update()
-async def handle_raw_update(client, update, users, chats):
-    # This handles bot startup/shutdown
-    pass
+async def start_bot_with_retry():
+    """Start bot with flood wait retry mechanism"""
+    max_retries = 5
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            logger.info(f"🚀 Starting bot (Attempt {retry_count + 1}/{max_retries})...")
+            await app.start()
+            logger.info("✅ Bot started successfully!")
+            return True
+            
+        except FloodWait as e:
+            retry_count += 1
+            wait_time = e.value or 60
+            logger.warning(f"⏳ FloodWait on bot start. Waiting {wait_time} seconds...")
+            
+            # Exponential backoff
+            backoff_time = min(wait_time * (1.5 ** retry_count), 600)  # Max 10 minutes
+            logger.info(f"Backoff: {backoff_time:.1f}s before retry {retry_count}")
+            
+            await asyncio.sleep(backoff_time)
+            
+        except Exception as e:
+            logger.error(f"❌ Error starting bot: {e}")
+            return False
+    
+    logger.error(f"❌ Failed to start bot after {max_retries} retries")
+    return False
+
+async def stop_bot_safely():
+    """Stop bot safely"""
+    try:
+        # Cancel all pending tasks
+        await cancel_all_delete_tasks()
+        
+        # Stop the bot
+        if app.is_connected:
+            await app.stop()
+            logger.info("✅ Bot stopped safely")
+    except Exception as e:
+        logger.error(f"❌ Error stopping bot: {e}")
 
 def main():
     # Start HTTP server in a separate thread for Koyeb health checks
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
     
-    # Start the Telegram bot
-    print("BS Auto Filter Bot Started...")
+    # Create sessions directory if it doesn't exist
+    os.makedirs("./sessions", exist_ok=True)
     
-    # Setup signal handlers for clean shutdown
+    print("BS Auto Filter Bot Starting...")
+    
     try:
-        app.run()
+        # Run bot with retry mechanism
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Start bot with retries
+        success = loop.run_until_complete(start_bot_with_retry())
+        
+        if success:
+            # Bot started successfully, keep it running
+            logger.info("🤖 Bot is now running...")
+            loop.run_forever()
+        else:
+            logger.error("Failed to start bot after multiple attempts")
+            
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
-        # Cancel all pending tasks on exit
-        asyncio.run(cancel_all_delete_tasks())
+        # Clean shutdown
+        loop.run_until_complete(stop_bot_safely())
+        loop.close()
 
 if __name__ == "__main__":
+    # Add random module import at the top
+    import random
     main()
