@@ -19,6 +19,7 @@ if not firebase_admin._apps and FIREBASE_KEY:
     except Exception as e:
         print(f"Firebase Error: {e}")
 
+# IMPORTANT: The variable is named 'app_web'
 app_web = Flask(__name__)
 
 # --- UI TEMPLATE ---
@@ -402,8 +403,7 @@ HTML_TEMPLATE = """
         document.getElementById('dGenres').innerText = item.media_type === 'tv' ? 'TV Series' : 'Movie';
 
         // --- SMART QUERY CONSTRUCTION ---
-        // We append the year to the title to help the backend filter sequels
-        // e.g., Sends "Men in Black 1997" instead of just "Men in Black"
+        // Sends "Title Year" to backend
         const searchQuery = year !== 'N/A' ? `${title} ${year}` : title;
         findFiles(searchQuery);
         
@@ -474,7 +474,7 @@ def health():
     return "OK", 200
 
 # --- SMART BACKEND SEARCH ---
-@app.route('/api/search_db')
+@app_web.route('/api/search_db')
 def search_db():
     query = request.args.get('query', '').strip()
     if not query: return jsonify([])
