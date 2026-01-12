@@ -18,10 +18,9 @@ from firebase_admin import credentials, db
 API_ID = os.environ.get("API_ID", "0")
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "0")
-MOVIE_CHANNEL = os.environ.get("MOVIE_CHANNEL", "")
-MOVIE_CHANNEL_LINK = os.environ.get("MOVIE_CHANNEL_LINK", "")
-JOIN_CHANNEL = os.environ.get("JOIN_CHANNEL", "")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))  # Source channel for indexing (ID)
+MOVIE_CHANNEL_ID = int(os.environ.get("MOVIE_CHANNEL_ID", "0"))  # Channel to post movies (ID)
+JOIN_CHANNEL_ID = int(os.environ.get("JOIN_CHANNEL_ID", "0"))  # Channel users must join (ID, optional)
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
@@ -31,10 +30,9 @@ print("ENVIRONMENT VARIABLES CHECK:")
 print(f"API_ID: {'Set' if API_ID and API_ID != '0' else 'NOT SET'}")
 print(f"API_HASH: {'Set' if API_HASH else 'NOT SET'}")
 print(f"BOT_TOKEN: {'Set' if BOT_TOKEN else 'NOT SET'}")
-print(f"CHANNEL_ID: {'Set' if CHANNEL_ID and CHANNEL_ID != '0' else 'NOT SET'}")
-print(f"MOVIE_CHANNEL: {'Set' if MOVIE_CHANNEL else 'NOT SET'}")
-print(f"MOVIE_CHANNEL_LINK: {'Set' if MOVIE_CHANNEL_LINK else 'NOT SET'}")
-print(f"JOIN_CHANNEL: {'Set' if JOIN_CHANNEL else 'NOT SET'}")
+print(f"CHANNEL_ID: {CHANNEL_ID if CHANNEL_ID != 0 else 'NOT SET'}")
+print(f"MOVIE_CHANNEL_ID: {MOVIE_CHANNEL_ID if MOVIE_CHANNEL_ID != 0 else 'NOT SET'}")
+print(f"JOIN_CHANNEL_ID: {JOIN_CHANNEL_ID if JOIN_CHANNEL_ID != 0 else 'NOT SET'}")
 print(f"DB_URL: {'Set' if DB_URL else 'NOT SET'}")
 print(f"FIREBASE_KEY: {'Set' if FIREBASE_KEY else 'NOT SET'}")
 print("=" * 50)
@@ -104,6 +102,7 @@ USER_SEARCHES = {}
 RESULTS_PER_PAGE = 10
 DELETE_TASKS = {}
 MOVIE_POSTS = {}
+CHANNEL_INVITE_LINKS = {}  # Store generated invite links
 
 # --- HELPER FUNCTIONS ---
 def get_size(size):
@@ -147,39 +146,120 @@ async def delete_message_after_delay(message_id, chat_id, delay_minutes=2, messa
         logger.error(f"❌ Error in delete_message_after_delay: {e}")
 
 async def check_user_in_channel(user_id):
-    """Check if user is member of required channel"""
+    """Check if user is member of required channel using channel ID"""
     try:
-        if not JOIN_CHANNEL or "t.me" not in JOIN_CHANNEL:
+        if not JOIN_CHANNEL_ID or JOIN_CHANNEL_ID == 0:
             return True
             
-        channel_username = JOIN_CHANNEL.split("/")[-1]
-        if not channel_username:
-            return True
-            
+        # Check membership using channel ID
         try:
-            user = await bot.get_chat_member(channel_username, user_id)
+            user = await bot.get_chat_member(JOIN_CHANNEL_ID, user_id)
             return user.status in ["member", "administrator", "creator"]
         except UserNotParticipant:
             return False
         except Exception as e:
             logger.error(f"Error checking channel membership: {e}")
-            return True
+            return True  # Allow access on error
     except Exception as e:
         logger.error(f"Error in check_user_in_channel: {e}")
         return True
+
+async def generate_invite_link():
+    """Generate an invite link for the join channel"""
+    try:
+        if not JOIN_CHANNEL_ID or JOIN_CHANNEL_ID == 0:
+            return None
+            
+        # Check if we already have a link
+        if JOIN_CHANNEL_ID in CHANNEL_INVITE_LINKS:
+            link_info = CHANNEL_INVITE_LINKS[JOIN_CHANNEL_ID]
+            # Check if link is still valid (not expired)
+            if link_info['expires_at'] > datetime.now():
+                return link_info['invite_link']
+        
+        # Create new invite link
+        chat = await bot.get_chat(JOIN_CHANNEL_ID)
+        
+        # Try to get existing invite links first
+        try:
+            invite_links = await bot.get_chat_invite_links(JOIN_CHANNEL_ID, limit=1)
+            if invite_links:
+                return invite_links[0].invite_link
+        except:
+            pass
+        
+        # Create new invite link (expires in 1 day, unlimited uses)
+        invite_link = await bot.create_chat_invite_link(
+            chat_id=JOIN_CHANNEL_ID,
+            name="Bot Join Link",
+            creates_join_request=False,
+            expire_date=datetime.now().timestamp() + (24 * 60 * 60),  # 24 hours
+            member_limit=None  # Unlimited
+        )
+        
+        # Store the link
+        CHANNEL_INVITE_LINKS[JOIN_CHANNEL_ID] = {
+            'invite_link': invite_link.invite_link,
+            'expires_at': datetime.fromtimestamp(invite_link.expire_date) if invite_link.expire_date else datetime.now() + timedelta(days=365)
+        }
+        
+        return invite_link.invite_link
+        
+    except Exception as e:
+        logger.error(f"Error generating invite link: {e}")
+        # Fallback: Try to get chat info and generate basic link
+        try:
+            chat = await bot.get_chat(JOIN_CHANNEL_ID)
+            if chat.username:
+                return f"https://t.me/{chat.username}"
+            else:
+                # For private channels, we need to create an invite
+                invite = await bot.create_chat_invite_link(
+                    chat_id=JOIN_CHANNEL_ID,
+                    name="Temporary Bot Join Link",
+                    expire_date=datetime.now().timestamp() + (3600),  # 1 hour
+                    member_limit=100
+                )
+                return invite.invite_link
+        except Exception as e2:
+            logger.error(f"Error in fallback invite generation: {e2}")
+            return None
+
+async def get_channel_message_link(channel_id, message_id):
+    """Generate a message link for a channel post"""
+    try:
+        # Get chat info to check if it has username
+        chat = await bot.get_chat(channel_id)
+        
+        if hasattr(chat, 'username') and chat.username:
+            # Public channel with username
+            return f"https://t.me/{chat.username}/{message_id}"
+        else:
+            # Private channel - generate t.me/c/ link
+            # Remove -100 prefix for t.me/c/ links
+            channel_id_str = str(channel_id)
+            if channel_id_str.startswith('-100'):
+                channel_num = channel_id_str[4:]
+            else:
+                channel_num = channel_id_str
+            
+            return f"https://t.me/c/{channel_num}/{message_id}"
+            
+    except Exception as e:
+        logger.error(f"Error generating message link: {e}")
+        return f"https://t.me/c/{str(channel_id).replace('-100', '')}/{message_id}"
 
 # --- CREATE BOT CLIENT ---
 def create_bot():
     try:
         api_id = int(API_ID) if API_ID and API_ID != "0" else None
-        channel_id = int(CHANNEL_ID) if CHANNEL_ID and CHANNEL_ID != "0" else None
         
         if not api_id or not API_HASH or not BOT_TOKEN:
             print("❌ Missing API credentials")
             return None
             
         print("🤖 Creating bot client...")
-        bot = Client(
+        bot_client = Client(
             name="bs_auto_filter_bot",
             api_id=api_id,
             api_hash=API_HASH,
@@ -188,7 +268,7 @@ def create_bot():
             sleep_threshold=30
         )
         print("✅ Bot client created")
-        return bot
+        return bot_client
     except Exception as e:
         print(f"❌ Error creating bot: {e}")
         return None
@@ -243,8 +323,8 @@ async def send_results_page(message, editable_msg, page=1):
 async def post_movie_to_channel(file_data, user_id):
     """Post movie to channel and return message link"""
     try:
-        if not MOVIE_CHANNEL:
-            logger.error("❌ MOVIE_CHANNEL not configured")
+        if not MOVIE_CHANNEL_ID or MOVIE_CHANNEL_ID == 0:
+            logger.error("❌ MOVIE_CHANNEL_ID not configured")
             return None
         
         file_name = file_data.get('file_name', 'Unknown')
@@ -255,33 +335,24 @@ async def post_movie_to_channel(file_data, user_id):
                  f"⏰ **Auto-deletes in 2 minutes**\n\n" \
                  f"#BSAutoFilterBot"
         
-        # Convert channel ID
-        channel_id = MOVIE_CHANNEL
-        if isinstance(MOVIE_CHANNEL, str):
-            if MOVIE_CHANNEL.startswith('@'):
-                channel_id = MOVIE_CHANNEL
-            elif MOVIE_CHANNEL.lstrip('-').isdigit():
-                channel_id = int(MOVIE_CHANNEL)
-        
         # Post to movie channel
         message = await bot.send_cached_media(
-            chat_id=channel_id,
+            chat_id=MOVIE_CHANNEL_ID,
             file_id=file_data['file_id'],
             caption=caption
         )
         
         # Generate message link
-        if isinstance(channel_id, str) and channel_id.startswith('@'):
-            channel_username = channel_id.lstrip('@')
-            message_link = f"https://t.me/{channel_username}/{message.id}"
-        else:
-            channel_str = str(channel_id).replace('-100', '')
-            message_link = f"https://t.me/c/{channel_str}/{message.id}"
+        message_link = await get_channel_message_link(MOVIE_CHANNEL_ID, message.id)
+        
+        if not message_link:
+            # Fallback link generation
+            message_link = f"https://t.me/c/{str(MOVIE_CHANNEL_ID).replace('-100', '')}/{message.id}"
         
         # Schedule auto-delete in 2 minutes
-        task_key = f"{message.id}_{channel_id}"
+        task_key = f"{message.id}_{MOVIE_CHANNEL_ID}"
         delete_task = asyncio.create_task(
-            delete_message_after_delay(message.id, channel_id, 2, "channel_movie")
+            delete_message_after_delay(message.id, MOVIE_CHANNEL_ID, 2, "channel_movie")
         )
         DELETE_TASKS[task_key] = delete_task
         
@@ -302,7 +373,7 @@ def setup_handlers(bot_instance):
     global bot
     bot = bot_instance
     
-    @bot.on_message(filters.chat(int(CHANNEL_ID)) & (filters.document | filters.video) if CHANNEL_ID and CHANNEL_ID != "0" else filters.none)
+    @bot.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video) if CHANNEL_ID != 0 else filters.none)
     async def index_files(client, message):
         try:
             media = message.document or message.video
@@ -355,32 +426,56 @@ def setup_handlers(bot_instance):
                      f"• Movie posts auto-delete in **2 minutes** ⏰\n" \
                      f"• Search results auto-delete in **10 minutes** ⏰\n\n"
         
-        if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
+        if JOIN_CHANNEL_ID and JOIN_CHANNEL_ID != 0:
             start_text += f"📢 **Required:** Join our channel to access movies!\n"
         
         await message.reply_text(start_text)
     
-    @bot.on_message(filters.command("ping") & filters.private)
-    async def ping_command(client, message):
-        start_time = time.time()
-        msg = await message.reply_text("🏓 Pong!")
-        end_time = time.time()
-        await msg.edit_text(f"🏓 Pong! `{round((end_time - start_time) * 1000, 2)}ms`")
-    
-    @bot.on_message(filters.command("status") & filters.private)
-    async def status_command(client, message):
-        ref = db.reference('files')
-        snapshot = ref.get()
-        total_files = len(snapshot) if snapshot else 0
+    @bot.on_message(filters.command("channels") & filters.private)
+    async def channels_command(client, message):
+        """Show information about configured channels"""
+        channels_info = "**📢 Configured Channels:**\n\n"
         
-        await message.reply_text(
-            "**🤖 Bot Status:**\n"
-            f"✅ Online and running\n"
-            f"📊 Total files indexed: {total_files}\n"
-            f"👤 User: {message.from_user.first_name}\n"
-            f"🆔 ID: {message.from_user.id}\n"
-            f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
-        )
+        if CHANNEL_ID != 0:
+            try:
+                source_chat = await bot.get_chat(CHANNEL_ID)
+                channels_info += f"**Source Channel:**\n"
+                channels_info += f"• Name: {source_chat.title}\n"
+                channels_info += f"• ID: `{CHANNEL_ID}`\n"
+                if hasattr(source_chat, 'username'):
+                    channels_info += f"• Username: @{source_chat.username}\n"
+                channels_info += f"• Role: Indexing files\n\n"
+            except Exception as e:
+                channels_info += f"**Source Channel:** Error: {str(e)[:50]}...\n\n"
+        
+        if MOVIE_CHANNEL_ID != 0:
+            try:
+                movie_chat = await bot.get_chat(MOVIE_CHANNEL_ID)
+                channels_info += f"**Movie Channel:**\n"
+                channels_info += f"• Name: {movie_chat.title}\n"
+                channels_info += f"• ID: `{MOVIE_CHANNEL_ID}`\n"
+                if hasattr(movie_chat, 'username'):
+                    channels_info += f"• Username: @{movie_chat.username}\n"
+                channels_info += f"• Role: Posting movies (2-min auto-delete)\n\n"
+            except Exception as e:
+                channels_info += f"**Movie Channel:** Error: {str(e)[:50]}...\n\n"
+        
+        if JOIN_CHANNEL_ID != 0:
+            try:
+                join_chat = await bot.get_chat(JOIN_CHANNEL_ID)
+                channels_info += f"**Join Channel:**\n"
+                channels_info += f"• Name: {join_chat.title}\n"
+                channels_info += f"• ID: `{JOIN_CHANNEL_ID}`\n"
+                if hasattr(join_chat, 'username'):
+                    channels_info += f"• Username: @{join_chat.username}\n"
+                channels_info += f"• Role: Required for access\n\n"
+            except Exception as e:
+                channels_info += f"**Join Channel:** Error: {str(e)[:50]}...\n\n"
+        
+        if CHANNEL_ID == 0 and MOVIE_CHANNEL_ID == 0 and JOIN_CHANNEL_ID == 0:
+            channels_info += "No channels configured yet.\n"
+        
+        await message.reply_text(channels_info)
     
     @bot.on_message(filters.text & filters.private)
     async def search_handler(client, message):
@@ -390,16 +485,26 @@ def setup_handlers(bot_instance):
             return
         
         # Check channel membership
-        if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
+        if JOIN_CHANNEL_ID and JOIN_CHANNEL_ID != 0:
             is_member = await check_user_in_channel(message.from_user.id)
             if not is_member:
-                buttons = [[InlineKeyboardButton("🔗 Join Channel", url=JOIN_CHANNEL)]]
-                await message.reply_text(
-                    "⚠️ **Access Restricted!**\n\n"
-                    "You need to join our channel to use this bot.\n"
-                    "Please join the channel below and try again.",
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
+                # Generate invite link
+                invite_link = await generate_invite_link()
+                
+                if invite_link:
+                    buttons = [[InlineKeyboardButton("🔗 Join Channel", url=invite_link)]]
+                    await message.reply_text(
+                        "⚠️ **Access Restricted!**\n\n"
+                        "You need to join our channel to use this bot.\n"
+                        "Please join the channel using the button below and try again.",
+                        reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                else:
+                    await message.reply_text(
+                        "⚠️ **Access Restricted!**\n\n"
+                        "You need to join our channel to use this bot.\n"
+                        "Please contact admin for access."
+                    )
                 return
         
         msg = await message.reply_text("⏳ **Searching...**")
@@ -466,8 +571,11 @@ def setup_handlers(bot_instance):
                 # Prepare buttons
                 buttons = []
                 
-                if JOIN_CHANNEL and "t.me" in JOIN_CHANNEL:
-                    buttons.append([InlineKeyboardButton("🔗 Join Channel", url=JOIN_CHANNEL)])
+                if JOIN_CHANNEL_ID and JOIN_CHANNEL_ID != 0:
+                    # Generate invite link for this user
+                    invite_link = await generate_invite_link()
+                    if invite_link:
+                        buttons.append([InlineKeyboardButton("🔗 Join Channel", url=invite_link)])
                 
                 buttons.append([InlineKeyboardButton("🎬 Movie Post Link", url=message_link)])
                 
@@ -543,17 +651,22 @@ async def start_bot():
             
             # Send startup notification
             try:
+                startup_msg = f"🤖 **Bot Started Successfully!**\n\n" \
+                             f"Name: {me.first_name}\n" \
+                             f"Username: @{me.username}\n" \
+                             f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
+                             f"✅ **Channels Configured:**\n"
+                
+                if CHANNEL_ID != 0:
+                    startup_msg += f"• Source Channel: {CHANNEL_ID}\n"
+                if MOVIE_CHANNEL_ID != 0:
+                    startup_msg += f"• Movie Channel: {MOVIE_CHANNEL_ID}\n"
+                if JOIN_CHANNEL_ID != 0:
+                    startup_msg += f"• Join Channel: {JOIN_CHANNEL_ID}\n"
+                
                 await bot_instance.send_message(
                     chat_id=me.id,
-                    text=f"🤖 **Bot Started Successfully!**\n\n"
-                         f"Name: {me.first_name}\n"
-                         f"Username: @{me.username}\n"
-                         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                         f"✅ Features ready:\n"
-                         f"• File indexing\n"
-                         f"• Movie search\n"
-                         f"• Channel posting\n"
-                         f"• Auto-delete system"
+                    text=startup_msg
                 )
             except Exception as e:
                 print(f"⚠️ Could not send startup message: {e}")
@@ -595,7 +708,7 @@ async def cancel_all_delete_tasks():
 async def run_bot():
     """Main bot runner"""
     print("\n" + "="*50)
-    print("BS AUTO FILTER BOT - COMPLETE VERSION")
+    print("BS AUTO FILTER BOT - USING CHANNEL IDs")
     print("="*50)
     
     # Setup Firebase
@@ -608,19 +721,17 @@ async def run_bot():
         print("\n" + "="*50)
         print("✅ BOT IS RUNNING WITH ALL FEATURES!")
         print("="*50)
-        print("\n🎯 Available Features:")
-        print("   1. File indexing from channel")
-        print("   2. Movie search by name")
-        print("   3. Post movies to movie channel")
-        print("   4. Auto-delete system:")
-        print("      • Movie posts: 2 minutes")
-        print("      • Search results: 10 minutes")
-        print("      • User notifications: 5 minutes")
-        print("   5. Channel join requirement")
-        print("   6. Two buttons: Join Channel + Movie Link")
-        print("\n📱 Commands: /start, /ping, /status")
-        print("\n🌐 Health check: http://localhost:8080/")
-        print("⏰ Time:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print("\n🎯 Channel IDs Mode:")
+        print(f"   Source Channel ID: {CHANNEL_ID if CHANNEL_ID != 0 else 'Not set'}")
+        print(f"   Movie Channel ID: {MOVIE_CHANNEL_ID if MOVIE_CHANNEL_ID != 0 else 'Not set'}")
+        print(f"   Join Channel ID: {JOIN_CHANNEL_ID if JOIN_CHANNEL_ID != 0 else 'Not set'}")
+        print("\n🎯 Features:")
+        print("   • Dynamic invite link generation")
+        print("   • Channel membership check by ID")
+        print("   • Auto message link generation")
+        print("   • 2-min/10-min auto-delete system")
+        print("\n📱 Commands: /start, /channels")
+        print("🌐 Health check: http://localhost:8080/")
         print("="*50)
         
         try:
@@ -643,8 +754,8 @@ async def run_bot():
         print("Troubleshooting:")
         print("1. Check all environment variables")
         print("2. Verify bot token with @BotFather")
-        print("3. Wait if FloodWait restriction")
-        print("4. Ensure bot has access to channels")
+        print("3. Ensure bot is admin in all channels")
+        print("4. Wait if FloodWait restriction")
         print("="*50)
     
     print("👋 Bot process ended")
@@ -660,7 +771,7 @@ def main():
     time.sleep(2)
     
     # Start the bot
-    print("🚀 Starting Telegram bot with all features...")
+    print("🚀 Starting Telegram bot...")
     
     try:
         loop = asyncio.new_event_loop()
@@ -677,6 +788,9 @@ def main():
         print("👋 Application ended")
 
 if __name__ == "__main__":
+    # Import timedelta for invite link expiration
+    from datetime import timedelta
+    
     # Initialize bot variable
     bot = None
     
