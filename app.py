@@ -37,7 +37,9 @@ HTML_TEMPLATE = """
             --surface: #1b1c21;
             --text-main: #ffffff;
             --text-sec: #a0a0a0;
-            --accent: #e50914; /* Netflix Red */
+            --accent: #e50914;
+            --badge-sd: #6c757d;
+            --badge-480: #8e44ad;
             --badge-720: #ff9f1c;
             --badge-1080: #2ec4b6;
             --badge-4k: #d90429;
@@ -113,9 +115,9 @@ HTML_TEMPLATE = """
         
         .scroll-container {
             display: flex; overflow-x: auto; gap: 15px; padding: 0 20px;
-            scrollbar-width: none; /* Firefox */
+            scrollbar-width: none;
         }
-        .scroll-container::-webkit-scrollbar { display: none; } /* Chrome */
+        .scroll-container::-webkit-scrollbar { display: none; }
 
         .poster-card {
             min-width: 130px; width: 130px;
@@ -196,10 +198,12 @@ HTML_TEMPLATE = """
         .file-size { font-size: 12px; color: var(--text-sec); margin-top: 3px; }
         
         .quality-badge {
-            font-size: 10px; font-weight: 800; padding: 4px 8px; border-radius: 4px; color: #000;
+            font-size: 10px; font-weight: 800; padding: 4px 8px; border-radius: 4px; color: #fff;
         }
-        .q-720 { background: var(--badge-720); }
-        .q-1080 { background: var(--badge-1080); }
+        .q-sd { background: var(--badge-sd); }
+        .q-480 { background: var(--badge-480); }
+        .q-720 { background: var(--badge-720); color: #000; }
+        .q-1080 { background: var(--badge-1080); color: #000; }
         .q-4k { background: var(--badge-4k); color: white; }
 
         .loader { text-align: center; padding: 30px; color: var(--text-sec); }
@@ -223,7 +227,6 @@ HTML_TEMPLATE = """
 
         <!-- MAIN CONTENT SCROLL -->
         <div id="mainContent">
-            
             <!-- HERO SECTION -->
             <div class="hero-wrapper" id="heroSection"></div>
 
@@ -238,7 +241,6 @@ HTML_TEMPLATE = """
             <!-- 3. HORROR -->
             <div class="section-header"><i class="fas fa-ghost"></i> Horror Hits</div>
             <div class="scroll-container" id="horrorSection"></div>
-
         </div>
 
         <!-- SEARCH RESULTS LAYOUT -->
@@ -274,22 +276,17 @@ HTML_TEMPLATE = """
     const tg = window.Telegram.WebApp;
     tg.ready();
     tg.expand();
-    tg.setHeaderColor('#0f1014'); // Match bg color
+    tg.setHeaderColor('#0f1014');
 
     const tmdbKey = "{{ tmdb_key }}";
     
-    // Initialize
     loadHomePage();
 
     // --- FETCH DATA LOGIC ---
     async function loadHomePage() {
-        // 1. Trending for Hero
         fetchTrending();
-        // 2. Newly Released (Now Playing)
         fetchSection(`https://api.themoviedb.org/3/movie/now_playing?api_key=${tmdbKey}`, 'newReleases');
-        // 3. Thriller (Genre 53)
         fetchSection(`https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_genres=53&sort_by=popularity.desc`, 'thrillerSection');
-        // 4. Horror (Genre 27)
         fetchSection(`https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_genres=27&sort_by=popularity.desc`, 'horrorSection');
     }
 
@@ -393,16 +390,20 @@ HTML_TEMPLATE = """
             ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` 
             : (item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '');
             
-        document.getElementById('dTitle').innerText = item.title || item.name;
-        document.getElementById('dYear').innerText = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
+        const title = item.title || item.name;
+        document.getElementById('dTitle').innerText = title;
+        
+        const year = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
+        document.getElementById('dYear').innerText = year;
+        
         document.getElementById('dRating').innerText = item.vote_average ? item.vote_average.toFixed(1) : 'N/A';
         document.getElementById('dOverview').innerText = item.overview || "No synopsis available.";
-        
-        // Simple Genres
-        // (In a real app, map IDs to names. For now, hardcode "Movie" or pass genres)
         document.getElementById('dGenres').innerText = item.media_type === 'tv' ? 'TV Series' : 'Movie';
 
-        findFiles(item.title || item.name);
+        // SEARCH WITH TITLE + YEAR TO AVOID WRONG SEQUELS
+        const searchQuery = year !== 'N/A' ? `${title} ${year}` : title;
+        findFiles(searchQuery);
+        
         document.getElementById('detailsPage').classList.add('active');
     }
 
@@ -425,11 +426,15 @@ HTML_TEMPLATE = """
             }
 
             files.forEach(f => {
-                let badgeClass = 'q-720'; 
-                let badgeText = '720p';
+                // Resolution Badge Logic
+                let badgeClass = 'q-sd'; 
+                let badgeText = 'SD';
                 const name = f.file_name.toLowerCase();
-                if (name.includes('1080p')) { badgeClass = 'q-1080'; badgeText = '1080p'; }
+                
                 if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'q-4k'; badgeText = '4K'; }
+                else if (name.includes('1080p')) { badgeClass = 'q-1080'; badgeText = '1080p'; }
+                else if (name.includes('720p')) { badgeClass = 'q-720'; badgeText = '720p'; }
+                else if (name.includes('480p')) { badgeClass = 'q-480'; badgeText = '480p'; }
                 
                 let size = (f.file_size / (1024*1024)).toFixed(0) + ' MB';
                 if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
@@ -467,23 +472,24 @@ def health():
 
 @app_web.route('/api/search_db')
 def search_db():
-    query = request.args.get('query', '').lower().strip()
+    query = request.args.get('query', '').strip()
     if not query: return jsonify([])
-    
-    # Simple cleaner
-    clean_q = "".join(e for e in query if e.isalnum()).lower()[:15]
 
+    # Strict Logic: Check if ALL words in query exist in filename
+    clean_query_parts = query.lower().split()
+    
     ref = db.reference('files')
     snapshot = ref.get()
     
     results = []
     if snapshot:
         for key, val in snapshot.items():
-            f_name = val.get('file_name', '').lower().replace(".", " ")
-            if query in f_name:
+            f_name = val.get('file_name', '').lower().replace(".", " ").replace("_", " ")
+            
+            # This ensures "Men in Black 1997" doesn't match "Men in Black 3"
+            if all(part in f_name for part in clean_query_parts):
                 results.append(val)
     
-    # Return max 50 to prevent lag
     return jsonify(results[:50])
 
 def run_flask_server():
