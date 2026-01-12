@@ -27,165 +27,245 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>MovieClubFamily</title>
+    <title>MovieClub</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {
-            --bg: #ffffff;
-            --text-main: #1a1a1a;
-            --text-sec: #6c757d;
-            --primary: #0088cc;
-            --badge-720: #fd7e14;
-            --badge-1080: #0d6efd;
-            --badge-2160: #198754;
+            --bg: #0f1014;
+            --surface: #1b1c21;
+            --text-main: #ffffff;
+            --text-sec: #a0a0a0;
+            --accent: #e50914; /* Netflix Red */
+            --badge-720: #ff9f1c;
+            --badge-1080: #2ec4b6;
+            --badge-4k: #d90429;
         }
 
         body {
             background-color: var(--bg);
             color: var(--text-main);
-            font-family: 'Inter', sans-serif;
+            font-family: 'Urbanist', sans-serif;
             margin: 0; padding: 0;
-            padding-bottom: 40px;
+            padding-bottom: 50px;
+            -webkit-font-smoothing: antialiased;
         }
 
-        /* HEADER */
+        /* --- HEADER --- */
         .header {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 15px 20px; background: #fff; position: sticky; top: 0; z-index: 100;
+            padding: 15px 20px;
+            background: rgba(15, 16, 20, 0.95);
+            backdrop-filter: blur(10px);
+            position: sticky; top: 0; z-index: 100;
+            display: flex; align-items: center; justify-content: space-between;
         }
-        .brand { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 10px; }
-        .theme-toggle { background: #f0f0f0; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border: none; }
+        .brand { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; color: #fff; }
+        .brand span { color: var(--accent); }
 
-        /* SEARCH BAR */
-        .search-container { padding: 0 20px 10px 20px; position:relative; z-index: 101; }
+        /* --- SEARCH --- */
+        .search-container { padding: 0 20px 10px 20px; position: sticky; top: 60px; z-index: 99; background: var(--bg); }
         .search-box {
-            background: #fff; border: 1px solid #e0e0e0; border-radius: 50px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.03); display: flex; align-items: center;
+            background: var(--surface);
+            border-radius: 12px;
+            display: flex; align-items: center;
+            padding: 0 15px;
+            border: 1px solid rgba(255,255,255,0.05);
         }
         .search-box input {
-            border: none; background: transparent; padding: 12px 20px; font-size: 15px; width: 100%; outline: none; border-radius: 50px;
+            background: transparent; border: none; color: white;
+            padding: 14px 10px; font-size: 15px; width: 100%; outline: none;
+            font-family: 'Urbanist', sans-serif;
         }
-        .search-btn {
-            background: var(--primary); color: white; border: none;
-            width: 38px; height: 38px; border-radius: 50%;
-            margin-right: 5px; display: flex; align-items: center; justify-content: center;
-        }
+        .search-box i { color: var(--text-sec); }
 
-        /* HERO CARD (TRENDING) */
+        /* --- HERO CARD --- */
+        .hero-wrapper { padding: 10px 20px; }
         .hero-card {
-            margin: 10px 20px 20px 20px;
-            height: 420px;
+            height: 400px;
             border-radius: 20px;
             background-size: cover; background-position: center;
             position: relative; overflow: hidden;
-            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
             display: flex; align-items: flex-end;
             cursor: pointer;
         }
         .hero-overlay {
-            background: linear-gradient(to top, rgba(0,0,0,0.95), transparent 90%);
-            width: 100%; padding: 25px; color: white;
-            display: flex; flex-direction: column; gap: 10px;
+            background: linear-gradient(to top, var(--bg) 5%, transparent 100%);
+            width: 100%; padding: 25px;
+            display: flex; flex-direction: column; gap: 8px;
         }
-        .popular-pill {
-            background: rgba(80, 80, 80, 0.6); backdrop-filter: blur(10px);
-            padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
-            width: fit-content; display: flex; align-items: center; gap: 6px;
-            position: absolute; top: 20px; left: 20px;
+        .trending-badge {
+            background: var(--accent); color: white;
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            padding: 4px 8px; border-radius: 6px; width: fit-content;
         }
-        .hero-title { font-size: 28px; font-weight: 800; line-height: 1.1; margin-top: 20px; }
-        .hero-desc { font-size: 13px; opacity: 0.8; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .hero-title { font-size: 28px; font-weight: 800; line-height: 1.1; text-shadow: 0 2px 10px rgba(0,0,0,0.5); }
+        .hero-meta { font-size: 13px; color: rgba(255,255,255,0.8); display: flex; gap: 10px; align-items: center; }
+
+        /* --- HORIZONTAL SECTIONS --- */
+        .section-header {
+            padding: 25px 20px 15px 20px;
+            font-size: 18px; font-weight: 700;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .section-header i { color: var(--accent); font-size: 16px; }
         
-        .genre-tags { display: flex; gap: 8px; margin-top: 5px; }
-        .genre-tag {
-            background: rgba(255,255,255,0.2); backdrop-filter: blur(5px);
-            padding: 5px 12px; border-radius: 15px; font-size: 12px; font-weight: 500;
+        .scroll-container {
+            display: flex; overflow-x: auto; gap: 15px; padding: 0 20px;
+            scrollbar-width: none; /* Firefox */
+        }
+        .scroll-container::-webkit-scrollbar { display: none; } /* Chrome */
+
+        .poster-card {
+            min-width: 130px; width: 130px;
+            display: flex; flex-direction: column; gap: 8px; cursor: pointer;
+        }
+        .poster-img {
+            width: 100%; height: 195px; border-radius: 12px;
+            object-fit: cover; background: var(--surface);
+        }
+        .poster-title {
+            font-size: 13px; font-weight: 600;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            color: rgba(255,255,255,0.9);
         }
 
-        /* SEARCH RESULTS LIST */
-        #searchResults {
-            display: none; padding: 0 20px; margin-top: 10px;
-        }
+        /* --- SEARCH RESULTS --- */
+        #searchResults { display: none; padding: 10px 20px; }
         .result-item {
-            display: flex; gap: 15px; margin-bottom: 15px; cursor: pointer;
+            display: flex; gap: 15px; margin-bottom: 15px;
+            background: var(--surface); padding: 10px; border-radius: 12px;
+            align-items: center; cursor: pointer;
         }
-        .result-img {
-            width: 50px; height: 75px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #eee;
-        }
-        .result-info {
-            display: flex; flex-direction: column; justify-content: center; border-bottom: 1px solid #f0f0f0; flex-grow: 1; padding-bottom: 15px;
-        }
-        .result-title { font-size: 15px; font-weight: 600; color: #333; margin-bottom: 4px; }
-        .result-meta { font-size: 13px; color: #888; }
-        .na-img { display: flex; align-items: center; justify-content: center; font-size: 10px; color: #aaa; border: 1px solid #eee; }
+        .result-img { width: 50px; height: 75px; border-radius: 8px; object-fit: cover; }
+        .result-info { display: flex; flex-direction: column; gap: 4px; }
+        .result-title { font-size: 15px; font-weight: 700; }
+        .result-year { font-size: 12px; color: var(--text-sec); }
 
-        /* DETAILS PAGE */
+        /* --- DETAILS MODAL --- */
         #detailsPage {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: #fff; z-index: 200; overflow-y: auto;
-            transform: translateX(100%); transition: transform 0.25s ease;
-            display: none;
+            background: var(--bg); z-index: 200; overflow-y: auto;
+            transform: translateY(100%); transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
         }
-        #detailsPage.active { transform: translateX(0); display: block; }
-        .back-btn { position: absolute; top: 15px; left: 15px; z-index: 10; background: #fff; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .backdrop { width: 100%; height: 260px; object-fit: cover; mask-image: linear-gradient(to bottom, black 80%, transparent 100%); }
-        .info-container { padding: 0 20px; margin-top: -30px; position: relative; }
-        .btn-play { background: #ff0000; color: white; border: none; width: 100%; padding: 14px; border-radius: 12px; font-weight: 600; font-size: 15px; display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 20px; }
+        #detailsPage.active { transform: translateY(0); }
         
-        /* FILE LIST */
-        .file-card { display: flex; align-items: center; background: #fff; border: 1px solid #eee; border-radius: 12px; padding: 12px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03); cursor: pointer; }
-        .file-icon { width: 45px; height: 45px; background: #f1f3f5; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-right: 12px; color: #555; font-size: 20px; }
-        .res-badge { font-size: 11px; font-weight: 700; color: white; padding: 4px 8px; border-radius: 6px; }
-        .res-720 { background-color: var(--badge-720); } .res-1080 { background-color: var(--badge-1080); } .res-4k { background-color: var(--badge-2160); }
+        .back-btn {
+            position: absolute; top: 15px; left: 15px; z-index: 201;
+            background: rgba(0,0,0,0.5); backdrop-filter: blur(5px);
+            width: 40px; height: 40px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            color: white; border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .backdrop-container { position: relative; width: 100%; height: 350px; }
+        .backdrop-img { width: 100%; height: 100%; object-fit: cover; }
+        .backdrop-fade {
+            position: absolute; bottom: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(to bottom, transparent 40%, var(--bg) 100%);
+        }
+
+        .content-body { padding: 0 20px 40px 20px; position: relative; margin-top: -60px; }
+        .movie-title-lg { font-size: 32px; font-weight: 800; line-height: 1.1; margin-bottom: 10px; }
+        
+        .meta-row { display: flex; gap: 15px; font-size: 14px; color: var(--text-sec); margin-bottom: 20px; align-items: center; }
+        .rating-box { color: #ffd700; font-weight: 700; display: flex; align-items: center; gap: 5px; }
+        
+        .overview { font-size: 14px; line-height: 1.6; color: #d0d0d0; margin-bottom: 30px; }
+
+        /* --- FILE LIST --- */
+        .file-list-header { font-size: 16px; font-weight: 700; margin-bottom: 15px; border-left: 3px solid var(--accent); padding-left: 10px; }
+        
+        .file-card {
+            background: var(--surface); padding: 15px; border-radius: 12px;
+            display: flex; align-items: center; gap: 15px; margin-bottom: 10px;
+            border: 1px solid rgba(255,255,255,0.05); cursor: pointer;
+            transition: 0.2s;
+        }
+        .file-card:active { transform: scale(0.98); background: #25262c; }
+        
+        .file-icon {
+            width: 40px; height: 40px; background: rgba(255,255,255,0.05);
+            border-radius: 50%; display: flex; align-items: center; justify-content: center;
+            color: var(--text-sec); font-size: 18px;
+        }
+        
+        .file-info { flex: 1; overflow: hidden; }
+        .file-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #fff; }
+        .file-size { font-size: 12px; color: var(--text-sec); margin-top: 3px; }
+        
+        .quality-badge {
+            font-size: 10px; font-weight: 800; padding: 4px 8px; border-radius: 4px; color: #000;
+        }
+        .q-720 { background: var(--badge-720); }
+        .q-1080 { background: var(--badge-1080); }
+        .q-4k { background: var(--badge-4k); color: white; }
+
+        .loader { text-align: center; padding: 30px; color: var(--text-sec); }
     </style>
 </head>
 <body>
 
-    <!-- HOME VIEW -->
+    <!-- HOME PAGE -->
     <div id="homeView">
         <div class="header">
-            <div class="brand"><i class="fas fa-lion"></i> MovieClubFamily</div>
-            <button class="theme-toggle"><i class="fas fa-sun"></i></button>
+            <div class="brand">Movie<span>Club</span></div>
+            <div style="font-size: 20px;"><i class="fas fa-user-circle"></i></div>
         </div>
 
         <div class="search-container">
             <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Search movies & TV series...">
-                <button class="search-btn"><i class="fas fa-search"></i></button>
+                <i class="fas fa-search"></i>
+                <input type="text" id="searchInput" placeholder="Search movies, series...">
             </div>
         </div>
 
-        <!-- HERO SECTION (Only visible when not searching) -->
-        <div id="heroSection"></div>
+        <!-- MAIN CONTENT SCROLL -->
+        <div id="mainContent">
+            
+            <!-- HERO SECTION -->
+            <div class="hero-wrapper" id="heroSection"></div>
 
-        <!-- SEARCH RESULTS (Only visible when searching) -->
+            <!-- 1. NEWLY RELEASED -->
+            <div class="section-header"><i class="fas fa-sparkles"></i> Newly Released</div>
+            <div class="scroll-container" id="newReleases"></div>
+
+            <!-- 2. THRILLER -->
+            <div class="section-header"><i class="fas fa-user-secret"></i> Thriller Picks</div>
+            <div class="scroll-container" id="thrillerSection"></div>
+
+            <!-- 3. HORROR -->
+            <div class="section-header"><i class="fas fa-ghost"></i> Horror Hits</div>
+            <div class="scroll-container" id="horrorSection"></div>
+
+        </div>
+
+        <!-- SEARCH RESULTS LAYOUT -->
         <div id="searchResults"></div>
-
     </div>
 
-    <!-- DETAILS VIEW -->
+    <!-- DETAILS MODAL -->
     <div id="detailsPage">
-        <div class="back-btn" onclick="closeDetails()"><i class="fas fa-arrow-left"></i></div>
-        <img id="dBackdrop" class="backdrop" src="">
-        <div class="info-container">
-            <h1 id="dTitle" style="font-size: 26px; font-weight: 800; margin-bottom: 5px;"></h1>
-            <div style="display:flex; gap:10px; font-size:13px; color:#666; margin-bottom:15px;">
-                <span style="border:1px solid #ccc; padding:0 4px; border-radius:3px; font-weight:700; color:#333;">PG-13</span>
-                <span id="dGenres"></span> • <span id="dYear"></span>
-            </div>
+        <div class="back-btn" onclick="closeDetails()"><i class="fas fa-chevron-down"></i></div>
+        
+        <div class="backdrop-container">
+            <img id="dBackdrop" class="backdrop-img" src="">
+            <div class="backdrop-fade"></div>
+        </div>
 
-            <button class="btn-play"><i class="fas fa-play"></i> Play Trailer</button>
+        <div class="content-body">
+            <div class="movie-title-lg" id="dTitle"></div>
             
-            <div style="font-size:14px; font-weight:bold; color:#f5c518; margin-bottom:15px;">
-                <i class="fas fa-star"></i> <span id="dRating"></span> IMDb
+            <div class="meta-row">
+                <span id="dYear"></span>
+                <span id="dGenres"></span>
+                <div class="rating-box"><i class="fas fa-star"></i> <span id="dRating"></span></div>
             </div>
 
-            <h3 style="font-size:18px; font-weight:700; margin-bottom:10px;">Overview</h3>
-            <p id="dOverview" style="font-size:14px; color:#555; line-height:1.6; margin-bottom:20px;"></p>
+            <div class="overview" id="dOverview"></div>
 
-            <h3 style="font-size:18px; font-weight:700; margin-bottom:10px;">Available Files</h3>
+            <div class="file-list-header">Available Downloads</div>
             <div id="fileListContainer"></div>
         </div>
     </div>
@@ -194,120 +274,133 @@ HTML_TEMPLATE = """
     const tg = window.Telegram.WebApp;
     tg.ready();
     tg.expand();
+    tg.setHeaderColor('#0f1014'); // Match bg color
 
     const tmdbKey = "{{ tmdb_key }}";
     
-    // Genre Map for Tags
-    const genres = { 
-        28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 
-        80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family", 
-        14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music", 
-        9648: "Mystery", 10749: "Romance", 878: "Science Fiction", 
-        10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western" 
-    };
+    // Initialize
+    loadHomePage();
 
-    // Load Trending on Start
-    fetchTrending();
-
-    // Search Logic
-    let searchTimeout;
-    const searchInput = document.getElementById('searchInput');
-    const heroSection = document.getElementById('heroSection');
-    const searchResults = document.getElementById('searchResults');
-
-    searchInput.addEventListener('input', (e) => {
-        clearTimeout(searchTimeout);
-        const query = e.target.value.trim();
-
-        if (query.length > 0) {
-            heroSection.style.display = 'none';
-            searchResults.style.display = 'block';
-            searchResults.innerHTML = '<div style="text-align:center; padding:20px; color:#888;"><i class="fas fa-spinner fa-spin"></i></div>';
-            
-            searchTimeout = setTimeout(() => performSearch(query), 500);
-        } else {
-            heroSection.style.display = 'block';
-            searchResults.style.display = 'none';
-            searchResults.innerHTML = '';
-        }
-    });
+    // --- FETCH DATA LOGIC ---
+    async function loadHomePage() {
+        // 1. Trending for Hero
+        fetchTrending();
+        // 2. Newly Released (Now Playing)
+        fetchSection(`https://api.themoviedb.org/3/movie/now_playing?api_key=${tmdbKey}`, 'newReleases');
+        // 3. Thriller (Genre 53)
+        fetchSection(`https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_genres=53&sort_by=popularity.desc`, 'thrillerSection');
+        // 4. Horror (Genre 27)
+        fetchSection(`https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_genres=27&sort_by=popularity.desc`, 'horrorSection');
+    }
 
     async function fetchTrending() {
         try {
             const res = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${tmdbKey}`);
             const data = await res.json();
             if (data.results && data.results.length > 0) {
-                renderHero(data.results[0]);
-            }
-        } catch (e) { console.error(e); }
-    }
-
-    function renderHero(movie) {
-        // Map Genre IDs to Names (Max 3)
-        const genreNames = movie.genre_ids.slice(0, 3).map(id => genres[id] || "").filter(Boolean);
-        const tagsHtml = genreNames.map(g => `<span class="genre-tag">${g}</span>`).join('');
-
-        const html = `
-            <div class="hero-card" onclick='openDetails(${JSON.stringify(movie)})' style="background-image: url('https://image.tmdb.org/t/p/w500${movie.poster_path}');">
-                <div class="popular-pill"><i class="fas fa-fire" style="color:#ffa500;"></i> Now Popular</div>
-                <div class="hero-overlay">
-                    <div class="genre-tags">${tagsHtml}</div>
-                    <div class="hero-title">${movie.title}</div>
-                    <div class="hero-desc">${movie.overview}</div>
-                </div>
-            </div>
-        `;
-        heroSection.innerHTML = html;
-    }
-
-    async function performSearch(query) {
-        try {
-            const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
-            const data = await res.json();
-            
-            searchResults.innerHTML = '';
-            
-            if (!data.results || data.results.length === 0) {
-                searchResults.innerHTML = '<div style="padding:20px; text-align:center; color:#888;">No results found</div>';
-                return;
-            }
-
-            data.results.forEach(item => {
-                if (item.media_type !== 'movie' && item.media_type !== 'tv') return;
-                
-                const title = item.title || item.name;
-                const year = (item.release_date || item.first_air_date || '').split('-')[0];
-                const imgUrl = item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : null;
-                const imgHtml = imgUrl ? `<img src="${imgUrl}" class="result-img">` : `<div class="result-img na-img">N/A</div>`;
-                const type = item.media_type === 'tv' ? 'TV Show' : 'Movie';
-
-                const div = document.createElement('div');
-                div.className = 'result-item';
-                // Pass full object safely
-                div.onclick = () => openDetails(item);
-                div.innerHTML = `
-                    ${imgHtml}
-                    <div class="result-info">
-                        <div class="result-title">${title}</div>
-                        <div class="result-meta">${type} (${year})</div>
+                const m = data.results[0];
+                const year = (m.release_date || '').split('-')[0];
+                document.getElementById('heroSection').innerHTML = `
+                    <div class="hero-card" onclick='openDetails(${JSON.stringify(m)})' 
+                         style="background-image: url('https://image.tmdb.org/t/p/w780${m.poster_path}')">
+                        <div class="hero-overlay">
+                            <div class="trending-badge">#1 Trending</div>
+                            <div class="hero-title">${m.title}</div>
+                            <div class="hero-meta">
+                                <span>${year}</span> • <span>${m.vote_average.toFixed(1)} <i class="fas fa-star" style="color:#ffd700"></i></span>
+                            </div>
+                        </div>
                     </div>
                 `;
-                searchResults.appendChild(div);
-            });
-        } catch (e) { console.error(e); }
+            }
+        } catch(e) { console.error(e); }
     }
 
-    // --- DETAILS & FILE LOGIC ---
+    async function fetchSection(url, containerId) {
+        try {
+            const res = await fetch(url);
+            const data = await res.json();
+            const container = document.getElementById(containerId);
+            
+            data.results.forEach(m => {
+                if(!m.poster_path) return;
+                const div = document.createElement('div');
+                div.className = 'poster-card';
+                div.onclick = () => openDetails(m);
+                div.innerHTML = `
+                    <img class="poster-img" src="https://image.tmdb.org/t/p/w300${m.poster_path}">
+                    <div class="poster-title">${m.title}</div>
+                `;
+                container.appendChild(div);
+            });
+        } catch(e) { console.error(e); }
+    }
+
+    // --- SEARCH LOGIC ---
+    let searchTimeout;
+    const searchInput = document.getElementById('searchInput');
+    const mainContent = document.getElementById('mainContent');
+    const searchResults = document.getElementById('searchResults');
+
+    searchInput.addEventListener('input', (e) => {
+        const query = e.target.value.trim();
+        clearTimeout(searchTimeout);
+
+        if(query.length > 1) {
+            mainContent.style.display = 'none';
+            searchResults.style.display = 'block';
+            searchResults.innerHTML = '<div class="loader"><i class="fas fa-circle-notch fa-spin"></i></div>';
+            searchTimeout = setTimeout(() => performSearch(query), 600);
+        } else {
+            mainContent.style.display = 'block';
+            searchResults.style.display = 'none';
+        }
+    });
+
+    async function performSearch(query) {
+        const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
+        const data = await res.json();
+        searchResults.innerHTML = '';
+        
+        if(!data.results.length) {
+            searchResults.innerHTML = '<div class="loader">No results found</div>';
+            return;
+        }
+
+        data.results.forEach(item => {
+            if(item.media_type !== 'movie' && item.media_type !== 'tv') return;
+            const title = item.title || item.name;
+            const year = (item.release_date || item.first_air_date || '').split('-')[0];
+            const img = item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : 'https://via.placeholder.com/50x75';
+            
+            const div = document.createElement('div');
+            div.className = 'result-item';
+            div.onclick = () => openDetails(item);
+            div.innerHTML = `
+                <img class="result-img" src="${img}">
+                <div class="result-info">
+                    <div class="result-title">${title}</div>
+                    <div class="result-year">${item.media_type.toUpperCase()} • ${year}</div>
+                </div>
+            `;
+            searchResults.appendChild(div);
+        });
+    }
+
+    // --- DETAILS PAGE LOGIC ---
     function openDetails(item) {
-        document.getElementById('dBackdrop').src = item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : '';
+        document.getElementById('dBackdrop').src = item.backdrop_path 
+            ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` 
+            : (item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '');
+            
         document.getElementById('dTitle').innerText = item.title || item.name;
         document.getElementById('dYear').innerText = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
-        document.getElementById('dOverview').innerText = item.overview || "No description available.";
-        document.getElementById('dRating').innerText = item.vote_average ? item.vote_average.toFixed(1) : "N/A";
+        document.getElementById('dRating').innerText = item.vote_average ? item.vote_average.toFixed(1) : 'N/A';
+        document.getElementById('dOverview').innerText = item.overview || "No synopsis available.";
         
-        // Genres string
-        const gList = item.genre_ids ? item.genre_ids.map(id => genres[id]).filter(Boolean).slice(0, 3).join(", ") : "Movie";
-        document.getElementById('dGenres').innerText = gList;
+        // Simple Genres
+        // (In a real app, map IDs to names. For now, hardcode "Movie" or pass genres)
+        document.getElementById('dGenres').innerText = item.media_type === 'tv' ? 'TV Series' : 'Movie';
 
         findFiles(item.title || item.name);
         document.getElementById('detailsPage').classList.add('active');
@@ -318,41 +411,46 @@ HTML_TEMPLATE = """
     }
 
     async function findFiles(query) {
-        const container = document.getElementById('fileListContainer');
-        container.innerHTML = '<div style="text-align:center; padding:20px; color:#888;"><i class="fas fa-spinner fa-spin"></i> Checking DB...</div>';
-        
-        const res = await fetch(`/api/search_db?query=${encodeURIComponent(query)}`);
-        const files = await res.json();
-        
-        container.innerHTML = '';
-        if (files.length === 0) {
-            container.innerHTML = '<p style="color:#999; text-align:center;">No files available yet.</p>';
-            return;
+        const listDiv = document.getElementById('fileListContainer');
+        listDiv.innerHTML = '<div class="loader"><i class="fas fa-circle-notch fa-spin"></i> Checking Library...</div>';
+
+        try {
+            const res = await fetch(`/api/search_db?query=${encodeURIComponent(query)}`);
+            const files = await res.json();
+            listDiv.innerHTML = '';
+
+            if (files.length === 0) {
+                listDiv.innerHTML = '<div style="text-align:center; color: #555; padding: 20px;">No files available yet. <br> Request this movie!</div>';
+                return;
+            }
+
+            files.forEach(f => {
+                let badgeClass = 'q-720'; 
+                let badgeText = '720p';
+                const name = f.file_name.toLowerCase();
+                if (name.includes('1080p')) { badgeClass = 'q-1080'; badgeText = '1080p'; }
+                if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'q-4k'; badgeText = '4K'; }
+                
+                let size = (f.file_size / (1024*1024)).toFixed(0) + ' MB';
+                if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
+
+                const div = document.createElement('div');
+                div.className = 'file-card';
+                div.onclick = () => tg.sendData(f.unique_id);
+                div.innerHTML = `
+                    <div class="file-icon"><i class="fas fa-play"></i></div>
+                    <div class="file-info">
+                        <div class="file-name">${f.file_name}</div>
+                        <div class="file-size">${size}</div>
+                    </div>
+                    <div class="quality-badge ${badgeClass}">${badgeText}</div>
+                `;
+                listDiv.appendChild(div);
+            });
+
+        } catch(e) {
+            listDiv.innerHTML = '<div class="loader">Error loading files.</div>';
         }
-
-        files.forEach(f => {
-            let badgeClass = 'res-720'; 
-            let badgeText = '720p';
-            const name = f.file_name.toLowerCase();
-            if (name.includes('1080p')) { badgeClass = 'res-1080'; badgeText = '1080p'; }
-            if (name.includes('2160p') || name.includes('4k')) { badgeClass = 'res-4k'; badgeText = '4K'; }
-            
-            let size = (f.file_size / (1024*1024)).toFixed(0) + ' MB';
-            if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
-
-            const div = document.createElement('div');
-            div.className = 'file-card';
-            div.onclick = () => tg.sendData(f.unique_id);
-            div.innerHTML = `
-                <div class="file-icon"><i class="fas fa-file-video"></i></div>
-                <div style="flex:1; overflow:hidden;">
-                    <div style="font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${f.file_name}</div>
-                    <div style="font-size:12px; color:#888; margin-top:4px;">Size: ${size}</div>
-                </div>
-                <div class="res-badge ${badgeClass}">${badgeText}</div>
-            `;
-            container.appendChild(div);
-        });
     }
 </script>
 </body>
@@ -372,8 +470,8 @@ def search_db():
     query = request.args.get('query', '').lower().strip()
     if not query: return jsonify([])
     
-    # Simple query clean
-    clean_q = "".join(e for e in query if e.isalnum()).lower()[:10]
+    # Simple cleaner
+    clean_q = "".join(e for e in query if e.isalnum()).lower()[:15]
 
     ref = db.reference('files')
     snapshot = ref.get()
@@ -384,6 +482,8 @@ def search_db():
             f_name = val.get('file_name', '').lower().replace(".", " ")
             if query in f_name:
                 results.append(val)
+    
+    # Return max 50 to prevent lag
     return jsonify(results[:50])
 
 def run_flask_server():
