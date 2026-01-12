@@ -11,94 +11,230 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
-# --- FIREBASE INIT (Safe Check) ---
-if not firebase_admin._apps:
+# --- FIREBASE INIT ---
+if not firebase_admin._apps and FIREBASE_KEY:
     try:
-        if FIREBASE_KEY:
-            cred = credentials.Certificate(json.loads(FIREBASE_KEY))
-            firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+        cred = credentials.Certificate(json.loads(FIREBASE_KEY))
+        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
     except Exception as e:
-        print(f"Firebase Error in App: {e}")
+        print(f"Firebase Error: {e}")
 
 app_web = Flask(__name__)
 
-# --- THE PREMIUM UI (HTML/CSS/JS) ---
+# --- THE EXACT UI REPLICA ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>MovieClub</title>
+    <title>MovieClubFamily</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        :root { --bg: #0f1014; --card: #1e1f24; --accent: #e50914; --text: #ffffff; --subtext: #a1a1a1; }
-        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-        
-        body { background-color: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; padding-bottom: 80px; }
-        
+        :root {
+            --bg: #ffffff;
+            --text-main: #1a1a1a;
+            --text-sec: #6c757d;
+            --primary: #0088cc;
+            --card-bg: #f8f9fa;
+            --border: #e9ecef;
+            --badge-720: #fd7e14;
+            --badge-1080: #0d6efd;
+            --badge-2160: #198754;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            margin: 0; padding: 0;
+            padding-bottom: 40px;
+        }
+
         /* HEADER */
-        .header { position: sticky; top: 0; background: rgba(15, 16, 20, 0.95); backdrop-filter: blur(10px); padding: 15px; z-index: 100; border-bottom: 1px solid #333; }
-        .search-box { position: relative; width: 100%; }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 15px 20px; background: #fff; position: sticky; top: 0; z-index: 100;
+        }
+        .brand { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 10px; }
+        .brand i { font-size: 24px; color: #333; }
+        .theme-toggle { background: #f0f0f0; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border: none; cursor: pointer; }
+
+        /* SEARCH BAR */
+        .search-container { padding: 0 20px 20px 20px; }
+        .search-box {
+            position: relative;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 50px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            display: flex; align-items: center;
+        }
         .search-box input {
-            width: 100%; background: #26272b; border: none; padding: 12px 45px 12px 15px;
-            border-radius: 12px; color: white; font-size: 16px; outline: none; transition: 0.3s;
+            border: none; background: transparent; padding: 14px 20px; font-size: 16px; width: 100%; outline: none; border-radius: 50px;
         }
-        .search-box input:focus { background: #333; box-shadow: 0 0 0 2px var(--accent); }
-        .search-box i { position: absolute; right: 15px; top: 50%; transform: translateY(-50%); color: var(--subtext); }
-
-        /* MOVIE CARDS */
-        .container { padding: 15px; }
-        .movie-card { display: flex; background: var(--card); border-radius: 12px; margin-bottom: 15px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.3); transition: transform 0.2s; }
-        .movie-card:active { transform: scale(0.98); }
-        
-        .poster { width: 100px; height: 150px; object-fit: cover; flex-shrink: 0; }
-        .info { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
-        
-        .title { font-size: 15px; font-weight: 700; line-height: 1.2; margin-bottom: 5px; }
-        .meta { font-size: 12px; color: var(--subtext); display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-        .rating { color: #ffb400; font-weight: 600; display: flex; align-items: center; gap: 4px; }
-        
-        /* FILE LIST (Hidden by default) */
-        .file-list { display: none; background: #15161a; padding: 10px; border-top: 1px solid #333; }
-        .file-list.show { display: block; animation: slideDown 0.3s ease; }
-        
-        .file-btn {
-            background: #2a2b30; color: white; padding: 12px; margin-top: 8px; border-radius: 8px;
-            display: flex; justify-content: space-between; align-items: center; font-size: 13px; cursor: pointer;
-        }
-        .file-btn:active { background: var(--accent); }
-        .file-info { display: flex; flex-direction: column; gap: 2px; }
-        .file-size { font-size: 11px; color: var(--subtext); }
-        .file-btn:active .file-size { color: rgba(255,255,255,0.8); }
-
-        .btn-expand {
-            background: rgba(255,255,255,0.1); border: none; color: white; padding: 6px 12px; 
-            border-radius: 6px; font-size: 12px; width: fit-content; margin-top: auto;
+        .search-btn {
+            background: var(--primary); color: white; border: none;
+            width: 40px; height: 40px; border-radius: 50%;
+            margin-right: 6px; display: flex; align-items: center; justify-content: center;
         }
 
-        /* UTILS */
+        /* HOME CONTENT */
+        .section-title { padding: 10px 20px; font-weight: 700; font-size: 18px; }
+        
+        .hero-card {
+            margin: 20px;
+            height: 400px;
+            border-radius: 20px;
+            background-size: cover; background-position: center;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            display: flex; align-items: flex-end;
+            cursor: pointer;
+        }
+        .hero-overlay {
+            background: linear-gradient(to top, rgba(0,0,0,0.9), transparent);
+            width: 100%; padding: 20px; color: white;
+        }
+        .popular-badge {
+            background: rgba(255,255,255,0.2); backdrop-filter: blur(5px);
+            padding: 5px 12px; border-radius: 20px; font-size: 12px;
+            display: inline-flex; align-items: center; gap: 5px; margin-bottom: 10px;
+        }
+
+        /* DETAILS PAGE */
+        #detailsPage {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #fff; z-index: 200; overflow-y: auto;
+            transform: translateX(100%); transition: transform 0.3s ease;
+            display: none;
+        }
+        #detailsPage.active { transform: translateX(0); display: block; }
+        
+        .back-btn {
+            position: absolute; top: 15px; left: 15px; z-index: 10;
+            background: rgba(255,255,255,0.8); border-radius: 50%;
+            width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+        }
+
+        .backdrop {
+            width: 100%; height: 250px; object-fit: cover;
+            mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+        }
+        
+        .info-container { padding: 0 20px; margin-top: -30px; position: relative; }
+        .movie-title { font-size: 24px; font-weight: 800; margin-bottom: 5px; }
+        .meta-tags { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #666; margin-bottom: 15px; }
+        .pg-badge { border: 1px solid #ccc; padding: 1px 4px; border-radius: 3px; font-size: 11px; font-weight: 700; color: #333; }
+        
+        .btn-play {
+            background: #ff0000; color: white; border: none;
+            width: 100%; padding: 12px; border-radius: 12px;
+            font-weight: 600; font-size: 15px; display: flex; align-items: center; justify-content: center; gap: 8px;
+            margin-bottom: 15px;
+        }
+
+        .section-header { font-size: 18px; font-weight: 700; margin: 20px 0 10px 0; }
+        
+        /* CAST */
+        .cast-scroll { display: flex; gap: 15px; overflow-x: auto; padding-bottom: 10px; }
+        .cast-item { min-width: 80px; text-align: center; }
+        .cast-img { width: 70px; height: 70px; border-radius: 15px; object-fit: cover; margin-bottom: 5px; }
+        .cast-name { font-size: 11px; font-weight: 700; }
+
+        /* EXACT FILE LIST UI */
+        .file-card {
+            display: flex; align-items: center;
+            background: #fff; border: 1px solid #eee;
+            border-radius: 10px; padding: 10px; margin-bottom: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.03);
+            cursor: pointer;
+        }
+        .file-card:active { background-color: #f5f5f5; }
+        
+        .file-icon {
+            width: 45px; height: 45px; background: #eee;
+            border-radius: 8px; display: flex; align-items: center; justify-content: center;
+            margin-right: 12px; color: #555; font-size: 20px;
+        }
+        .file-details { flex: 1; overflow: hidden; }
+        .file-name { font-size: 13px; font-weight: 600; color: #222; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .file-meta { font-size: 11px; color: #888; margin-top: 3px; display: flex; align-items: center; gap: 8px; }
+        
+        .res-badge {
+            font-size: 11px; font-weight: 700; color: white;
+            padding: 3px 8px; border-radius: 6px;
+        }
+        .res-720 { background-color: var(--badge-720); }
+        .res-1080 { background-color: var(--badge-1080); }
+        .res-4k { background-color: var(--badge-2160); }
+        .res-sd { background-color: #6c757d; }
+
         .hidden { display: none; }
-        .loader { text-align: center; padding: 20px; color: var(--accent); }
-        @keyframes slideDown { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        .loader { text-align: center; margin-top: 20px; color: var(--primary); }
+
+        /* Horizontal Scroll for Posters */
+        .h-scroll { display: flex; overflow-x: auto; gap: 10px; padding: 0 20px 20px 20px; }
+        .poster-card { min-width: 140px; border-radius: 10px; overflow: hidden; }
+        .poster-card img { width: 100%; height: 210px; object-fit: cover; }
     </style>
 </head>
 <body>
 
-    <div class="header">
-        <div class="search-box">
-            <input type="text" id="searchInput" placeholder="Search movies, series...">
-            <i class="fas fa-search"></i>
+    <!-- HOME VIEW -->
+    <div id="homeView">
+        <div class="header">
+            <div class="brand"><i class="fas fa-lion"></i> MovieClubFamily</div>
+            <button class="theme-toggle"><i class="fas fa-sun"></i></button>
+        </div>
+
+        <div class="search-container">
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="Search movies & TV series...">
+                <button class="search-btn"><i class="fas fa-search"></i></button>
+            </div>
+        </div>
+
+        <div id="homeContent">
+            <!-- Dynamic Content -->
+             <div class="loader" id="mainLoader"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
         </div>
     </div>
 
-    <div id="loading" class="loader hidden"><i class="fas fa-spinner fa-spin fa-2x"></i></div>
-    <div class="container" id="contentArea">
-        <div style="text-align:center; color: #555; margin-top: 50px;">
-            <i class="fas fa-film fa-3x"></i>
-            <p style="margin-top:10px;">Search for a movie to begin</p>
+    <!-- DETAILS VIEW (MODAL) -->
+    <div id="detailsPage">
+        <div class="back-btn" onclick="closeDetails()"><i class="fas fa-arrow-left"></i></div>
+        <img id="dBackdrop" class="backdrop" src="">
+        
+        <div class="info-container">
+            <h1 id="dTitle" class="movie-title"></h1>
+            <div class="meta-tags">
+                <span class="pg-badge">PG-13</span>
+                <span id="dGenres">Action</span> • 
+                <span id="dYear">2024</span>
+            </div>
+
+            <button class="btn-play"><i class="fas fa-play"></i> Play Trailer</button>
+            
+            <div style="font-size:14px; font-weight:bold; color:#f5c518; margin-bottom:10px;">
+                <i class="fas fa-star"></i> <span id="dRating"></span> IMDb
+            </div>
+
+            <h3 class="section-header">Overview</h3>
+            <p id="dOverview" style="font-size:13px; color:#555; line-height:1.5;"></p>
+
+            <h3 class="section-header">Cast</h3>
+            <div id="dCast" class="cast-scroll"></div>
+
+            <h3 class="section-header">Available Files <span id="fileCount" style="font-size:14px; color:#888;"></span></h3>
+            
+            <!-- FILE LIST CONTAINER -->
+            <div id="fileListContainer">
+                <div class="loader"><i class="fas fa-spinner fa-spin"></i> Checking database...</div>
+            </div>
         </div>
     </div>
 
@@ -106,154 +242,128 @@ HTML_TEMPLATE = """
     const tg = window.Telegram.WebApp;
     tg.ready();
     tg.expand();
-    
-    // Theme matching
-    if (tg.colorScheme === 'light') {
-        document.documentElement.style.setProperty('--bg', '#ffffff');
-        document.documentElement.style.setProperty('--card', '#f0f2f5');
-        document.documentElement.style.setProperty('--text', '#000000');
-    }
 
     const tmdbKey = "{{ tmdb_key }}";
-    let searchTimeout;
+    
+    // Init Home
+    fetchPopular();
 
+    // Search Listener
+    let searchTimeout;
     document.getElementById('searchInput').addEventListener('input', (e) => {
         clearTimeout(searchTimeout);
         const query = e.target.value.trim();
         if (query.length > 2) {
-            document.getElementById('loading').classList.remove('hidden');
-            document.getElementById('contentArea').innerHTML = '';
             searchTimeout = setTimeout(() => performSearch(query), 800);
+        } else if (query.length === 0) {
+            fetchPopular(); // Reset to home
         }
     });
 
+    async function fetchPopular() {
+        const res = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${tmdbKey}`);
+        const data = await res.json();
+        renderHome(data.results);
+    }
+
     async function performSearch(query) {
-        try {
-            // 1. Parallel Fetch (TMDB + Internal DB)
-            const [tmdbRes, dbRes] = await Promise.all([
-                fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`),
-                fetch(`/api/search_db?query=${query}`)
-            ]);
+        document.getElementById('homeContent').innerHTML = '<div class="loader"><i class="fas fa-spinner fa-spin"></i> Searching...</div>';
+        const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${tmdbKey}&query=${query}`);
+        const data = await res.json();
+        renderHome(data.results);
+    }
 
-            const tmdbData = await tmdbRes.json();
-            const dbFiles = await dbRes.json();
-            
-            document.getElementById('loading').classList.add('hidden');
-            const content = document.getElementById('contentArea');
+    function renderHome(items) {
+        const container = document.getElementById('homeContent');
+        container.innerHTML = '';
 
-            if (!tmdbData.results || tmdbData.results.length === 0) {
-                content.innerHTML = '<p style="text-align:center; margin-top:20px;">No results found.</p>';
-                return;
-            }
-
-            tmdbData.results.forEach(item => {
-                if (item.media_type !== 'movie' && item.media_type !== 'tv') return;
-
-                // Match Files
-                const title = item.title || item.name;
-                const cleanTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '');
-                
-                // Flexible matching logic
-                const matchedFiles = dbFiles.filter(f => {
-                    const fName = f.file_name.toLowerCase().replace(/[^a-z0-9]/g, '');
-                    return fName.includes(cleanTitle.substring(0, 5)); // Simple match
-                });
-
-                // Only show if files exist (Optional: remove this if you want to show all movies)
-                if (matchedFiles.length === 0) return;
-
-                const poster = item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : 'https://via.placeholder.com/100x150?text=No+Img';
-                const year = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
-                const rating = item.vote_average ? item.vote_average.toFixed(1) : '0.0';
-                
-                // Build Card HTML
-                const card = document.createElement('div');
-                card.className = 'movie-card-wrapper'; // Wrapper for animation
-                card.innerHTML = `
-                    <div class="movie-card">
-                        <img src="${poster}" class="poster">
-                        <div class="info">
-                            <div>
-                                <div class="title">${title}</div>
-                                <div class="meta">
-                                    <span>${year}</span>
-                                    <span class="rating"><i class="fas fa-star"></i> ${rating}</span>
-                                    <span style="background:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px;">${item.media_type.toUpperCase()}</span>
-                                </div>
-                            </div>
-                            <button class="btn-expand" onclick="toggleFiles(this)">
-                                ${matchedFiles.length} Files Available <i class="fas fa-chevron-down"></i>
-                            </button>
-                        </div>
-                    </div>
-                    <div class="file-list">
-                        ${matchedFiles.map(f => {
-                            let size = (f.file_size / (1024*1024)).toFixed(2) + ' MB';
-                            if (f.file_size > 1024*1024*1024) size = (f.file_size / (1024*1024*1024)).toFixed(2) + ' GB';
-                            return `
-                            <div class="file-btn" onclick="sendToBot('${f.unique_id}')">
-                                <div class="file-info">
-                                    <span>${f.file_name}</span>
-                                    <span class="file-size">${size}</span>
-                                </div>
-                                <i class="fas fa-download"></i>
-                            </div>`;
-                        }).join('')}
-                    </div>
-                `;
-                content.appendChild(card);
-            });
-
-        } catch (e) {
-            console.error(e);
+        if (!items || items.length === 0) {
+            container.innerHTML = '<p style="text-align:center; color:#999;">No results found.</p>';
+            return;
         }
-    }
 
-    window.toggleFiles = function(btn) {
-        const list = btn.closest('.movie-card-wrapper').querySelector('.file-list');
-        const icon = btn.querySelector('i');
-        if (list.style.display === 'block') {
-            list.style.display = 'none';
-            icon.className = 'fas fa-chevron-down';
-        } else {
-            list.style.display = 'block';
-            icon.className = 'fas fa-chevron-up';
+        // Hero Item (First Result)
+        const hero = items[0];
+        if (hero.backdrop_path) {
+            const heroEl = document.createElement('div');
+            heroEl.className = 'hero-card';
+            heroEl.style.backgroundImage = `url(https://image.tmdb.org/t/p/w500${hero.poster_path})`;
+            heroEl.onclick = () => openDetails(hero);
+            heroEl.innerHTML = `
+                <div class="hero-overlay">
+                    <div class="popular-badge"><i class="fas fa-fire"></i> Top Result</div>
+                    <div style="font-size:24px; font-weight:800;">${hero.title || hero.name}</div>
+                    <div style="font-size:13px; opacity:0.8;">${(hero.release_date || hero.first_air_date || '').split('-')[0]}</div>
+                </div>
+            `;
+            container.appendChild(heroEl);
         }
+
+        // Horizontal List for others
+        const title = document.createElement('div');
+        title.className = 'section-title';
+        title.innerText = 'More Results';
+        container.appendChild(title);
+
+        const scroll = document.createElement('div');
+        scroll.className = 'h-scroll';
+        
+        items.slice(1).forEach(item => {
+            if (!item.poster_path) return;
+            const card = document.createElement('div');
+            card.className = 'poster-card';
+            card.onclick = () => openDetails(item);
+            card.innerHTML = `<img src="https://image.tmdb.org/t/p/w200${item.poster_path}">`;
+            scroll.appendChild(card);
+        });
+        container.appendChild(scroll);
     }
 
-    window.sendToBot = function(id) {
-        tg.sendData(id);
+    // --- DETAILS LOGIC ---
+    async function openDetails(item) {
+        // Populate UI
+        document.getElementById('dBackdrop').src = item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : '';
+        document.getElementById('dTitle').innerText = item.title || item.name;
+        document.getElementById('dYear').innerText = (item.release_date || item.first_air_date || 'N/A').split('-')[0];
+        document.getElementById('dOverview').innerText = item.overview;
+        document.getElementById('dRating').innerText = item.vote_average.toFixed(1);
+
+        // Fetch Cast
+        fetchCast(item.id, item.media_type || 'movie');
+        
+        // Find Files
+        findFiles(item.title || item.name);
+
+        // Show Page
+        document.getElementById('detailsPage').classList.add('active');
     }
-</script>
-</body>
-</html>
-"""
 
-@app_web.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE, tmdb_key=TMDB_API_KEY)
+    function closeDetails() {
+        document.getElementById('detailsPage').classList.remove('active');
+    }
 
-@app_web.route('/health')
-def health():
-    return "OK", 200
+    async function fetchCast(id, type) {
+        const res = await fetch(`https://api.themoviedb.org/3/${type}/${id}/credits?api_key=${tmdbKey}`);
+        const data = await res.json();
+        const castDiv = document.getElementById('dCast');
+        castDiv.innerHTML = '';
+        
+        data.cast.slice(0, 10).forEach(c => {
+            if(!c.profile_path) return;
+            castDiv.innerHTML += `
+                <div class="cast-item">
+                    <img class="cast-img" src="https://image.tmdb.org/t/p/w200${c.profile_path}">
+                    <div class="cast-name">${c.name}</div>
+                </div>
+            `;
+        });
+    }
 
-@app_web.route('/api/search_db')
-def search_db():
-    query = request.args.get('query', '').lower().strip()
-    if not query: return jsonify([])
-    
-    ref = db.reference('files')
-    snapshot = ref.get()
-    
-    results = []
-    if snapshot:
-        for key, val in snapshot.items():
-            # Basic fuzzy search
-            if query in val.get('file_name', '').lower().replace(".", " "):
-                results.append(val)
-    
-    return jsonify(results[:50])
-
-def run_flask_server():
-    port = int(os.environ.get('PORT', 8080))
-    app_web.run(host='0.0.0.0', port=port)
+    async function findFiles(query) {
+        const listDiv = document.getElementById('fileListContainer');
+        listDiv.innerHTML = '<div class="loader"><i class="fas fa-spinner fa-spin"></i> Finding files...</div>';
+        
+        const res = await fetch(`/api/search_db?query=${encodeURIComponent(query)}`);
+        const files = await res.json();
+        
+        document.getElementById('fileCo
