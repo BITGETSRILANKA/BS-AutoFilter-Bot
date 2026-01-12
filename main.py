@@ -55,7 +55,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "status": "running",
                 "service": "BS Auto Filter Bot",
                 "timestamp": datetime.now().isoformat(),
-                "bot_status": "starting" if not hasattr(app, 'is_initialized') else "running"
+                "bot_status": "starting"
             }
             self.wfile.write(json.dumps(status).encode())
         else:
@@ -97,7 +97,7 @@ def setup_firebase():
         print(f"❌ Firebase Error: {e}")
         return False
 
-# --- SETUP BOT ---
+# --- CREATE BOT CLIENT ---
 def create_bot():
     try:
         # Convert string IDs to integers
@@ -117,53 +117,67 @@ def create_bot():
             workers=2,
             sleep_threshold=30
         )
-        bot.is_initialized = False
         print("✅ Bot client created")
         return bot
     except Exception as e:
         print(f"❌ Error creating bot: {e}")
         return None
 
-# --- BOT HANDLERS ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client, message):
-    print(f"📨 Received /start from {message.from_user.id}")
-    await message.reply_text(
-        f"👋 **Hey {message.from_user.first_name}!**\n"
-        f"Welcome to **BS Auto Filter Bot** 🎬\n\n"
-        f"Send me a movie name and I'll search for it."
-    )
+# --- BOT COMMAND HANDLERS ---
+def setup_handlers(bot):
+    """Setup all bot command handlers"""
+    
+    @bot.on_message(filters.command("start") & filters.private)
+    async def start_command(client, message):
+        print(f"📨 Received /start from {message.from_user.id}")
+        await message.reply_text(
+            f"👋 **Hey {message.from_user.first_name}!**\n"
+            f"Welcome to **BS Auto Filter Bot** 🎬\n\n"
+            f"Send me a movie name and I'll search for it."
+        )
 
-@app.on_message(filters.command("ping") & filters.private)
-async def ping_command(client, message):
-    print(f"🏓 Received /ping from {message.from_user.id}")
-    start_time = time.time()
-    msg = await message.reply_text("🏓 Pong!")
-    end_time = time.time()
-    await msg.edit_text(f"🏓 Pong! `{round((end_time - start_time) * 1000, 2)}ms`")
+    @bot.on_message(filters.command("ping") & filters.private)
+    async def ping_command(client, message):
+        print(f"🏓 Received /ping from {message.from_user.id}")
+        start_time = time.time()
+        msg = await message.reply_text("🏓 Pong!")
+        end_time = time.time()
+        await msg.edit_text(f"🏓 Pong! `{round((end_time - start_time) * 1000, 2)}ms`")
 
-@app.on_message(filters.command("status") & filters.private)
-async def status_command(client, message):
-    print(f"📊 Received /status from {message.from_user.id}")
-    await message.reply_text(
-        "**🤖 Bot Status:**\n"
-        "✅ Online and running\n"
-        f"👤 User: {message.from_user.first_name}\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
-    )
+    @bot.on_message(filters.command("status") & filters.private)
+    async def status_command(client, message):
+        print(f"📊 Received /status from {message.from_user.id}")
+        await message.reply_text(
+            "**🤖 Bot Status:**\n"
+            "✅ Online and running\n"
+            f"👤 User: {message.from_user.first_name}\n"
+            f"🆔 ID: {message.from_user.id}\n"
+            f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+        )
 
-@app.on_message(filters.text & filters.private)
-async def text_handler(client, message):
-    print(f"📝 Received text from {message.from_user.id}: {message.text[:50]}...")
-    if message.text.startswith('/'):
-        return
-        
-    await message.reply_text(
-        f"🔍 Searching for: `{message.text}`\n\n"
-        f"⚠️ **Note:** Full search functionality will be available once setup is complete.\n\n"
-        f"Bot is currently in setup mode. Please wait..."
-    )
+    @bot.on_message(filters.command("id") & filters.private)
+    async def id_command(client, message):
+        print(f"🆔 Received /id from {message.from_user.id}")
+        await message.reply_text(
+            f"**Your Info:**\n"
+            f"👤 Name: {message.from_user.first_name}\n"
+            f"🆔 ID: `{message.from_user.id}`\n"
+            f"📝 Chat ID: `{message.chat.id}`"
+        )
+
+    @bot.on_message(filters.text & filters.private)
+    async def text_handler(client, message):
+        if message.text.startswith('/'):
+            return
+            
+        print(f"📝 Received text from {message.from_user.id}: {message.text[:50]}...")
+        await message.reply_text(
+            f"🔍 You sent: `{message.text}`\n\n"
+            f"✅ Bot is working! Search functionality will be added soon."
+        )
+
+    print("✅ Bot handlers setup complete")
+    return bot
 
 # --- START BOT WITH RETRY ---
 async def start_bot():
@@ -175,33 +189,39 @@ async def start_bot():
             print(f"\n🚀 Starting bot (Attempt {attempt + 1}/{max_retries})...")
             
             # Create bot instance
-            global app
-            app = create_bot()
-            if not app:
+            bot = create_bot()
+            if not bot:
                 print("❌ Failed to create bot instance")
-                return False
+                return None
+            
+            # Setup handlers
+            bot = setup_handlers(bot)
             
             # Start the bot
-            await app.start()
+            await bot.start()
             print("✅ Bot started successfully!")
             
             # Get bot info
-            me = await app.get_me()
+            me = await bot.get_me()
             print(f"🤖 Bot Info:")
             print(f"   Name: {me.first_name}")
             print(f"   Username: @{me.username}")
             print(f"   ID: {me.id}")
             
-            app.is_initialized = True
+            # Send startup notification
+            try:
+                await bot.send_message(
+                    chat_id=me.id,
+                    text=f"🤖 **Bot Started Successfully!**\n\n"
+                         f"Name: {me.first_name}\n"
+                         f"Username: @{me.username}\n"
+                         f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                         f"✅ Ready to receive commands!"
+                )
+            except Exception as e:
+                print(f"⚠️ Could not send startup message: {e}")
             
-            # Send a test message to yourself (optional)
-            # Uncomment if you want test messages
-            # try:
-            #     await app.send_message(chat_id=me.id, text="🤖 Bot started successfully!")
-            # except:
-            #     pass
-            
-            return True
+            return bot
             
         except FloodWait as e:
             wait_time = e.value or 60
@@ -211,59 +231,72 @@ async def start_bot():
                 await asyncio.sleep(wait_time)
             else:
                 print(f"❌ Max retries reached. Failed due to FloodWait.")
-                return False
+                return None
                 
         except Exception as e:
-            print(f"❌ Error starting bot (Attempt {attempt + 1}): {str(e)[:100]}...")
+            print(f"❌ Error starting bot (Attempt {attempt + 1}): {str(e)}")
             if attempt < max_retries - 1:
                 print(f"💤 Waiting {retry_delay} seconds before retry...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
             else:
                 print(f"❌ Max retries reached.")
-                return False
+                return None
     
-    return False
+    return None
 
 async def run_bot():
     """Main bot runner"""
     print("\n" + "="*50)
-    print("BS AUTO FILTER BOT - DEBUG MODE")
+    print("BS AUTO FILTER BOT - STARTING")
     print("="*50)
     
     # Setup Firebase
     firebase_setup = setup_firebase()
     
     # Start bot
-    bot_started = await start_bot()
+    bot = await start_bot()
     
-    if bot_started:
-        print("\n✅ Bot is running!")
-        print("📱 You can now send /start to your bot")
-        print("🌐 Health check available at port 8080")
+    if bot:
+        print("\n" + "="*50)
+        print("✅ BOT IS RUNNING SUCCESSFULLY!")
+        print("="*50)
+        print("\n📱 Available Commands:")
+        print("   /start - Start the bot")
+        print("   /ping - Test bot response")
+        print("   /status - Check bot status")
+        print("   /id - Get your user ID")
+        print("\n🌐 Health check available at:")
+        print("   http://localhost:8080/")
+        print("   http://localhost:8080/health")
+        print("   http://localhost:8080/status")
+        print("\n⏰ Time:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print("="*50)
         
         # Keep the bot running
         try:
+            # Run forever
             await asyncio.Event().wait()
         except KeyboardInterrupt:
             print("\n🛑 Received shutdown signal...")
         except Exception as e:
             print(f"\n⚠️ Error in main loop: {e}")
+        finally:
+            # Clean shutdown
+            if bot:
+                print("🛑 Stopping bot...")
+                await bot.stop()
+                print("✅ Bot stopped cleanly")
     else:
-        print("\n❌ Failed to start bot")
+        print("\n❌ FAILED TO START BOT")
+        print("="*50)
         print("Please check:")
-        print("1. Environment variables")
-        print("2. Bot token validity")
-        print("3. Network connectivity")
-        print("4. Flood wait restrictions")
-    
-    # Clean shutdown
-    try:
-        if app and hasattr(app, 'is_initialized') and app.is_initialized:
-            await app.stop()
-            print("✅ Bot stopped cleanly")
-    except:
-        pass
+        print("1. ✅ Environment variables are set")
+        print("2. 🔑 Bot token is valid (check with @BotFather)")
+        print("3. 🌐 Internet connectivity")
+        print("4. ⏰ Wait if there's FloodWait restriction")
+        print("5. 🔄 Restart the app after fixing issues")
+        print("="*50)
     
     print("👋 Bot process ended")
 
@@ -292,13 +325,12 @@ def main():
         print("\n🛑 Bot stopped by user")
     except Exception as e:
         print(f"\n💥 Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         print("👋 Application ended")
 
 if __name__ == "__main__":
-    # Initialize app variable
-    app = None
-    
     # Check if we should run in simple mode (without full features)
     if not all([API_ID, API_HASH, BOT_TOKEN]):
         print("⚠️ WARNING: Missing required environment variables!")
