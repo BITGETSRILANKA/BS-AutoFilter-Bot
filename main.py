@@ -7,7 +7,11 @@ import threading
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    InlineQueryResultCachedDocument
+)
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -98,8 +102,14 @@ async def send_file_to_user(client, chat_id, unique_id):
             await client.send_message(chat_id, "❌ File not found or removed.")
             return
 
-        caption = f"{file_data.get('caption', '')}\n\n" \
-                  f"⏰ **This file will be automatically deleted in 2 minutes**"
+        # --- CLEAN CAPTION LOGIC ---
+        # We ignore the original caption and build a clean one
+        filename = file_data.get('file_name', 'Unknown File')
+        size = get_size(file_data.get('file_size', 0))
+        
+        caption = f"📁 **{filename}**\n" \
+                  f"📊 Size: {size}\n\n" \
+                  f"⏰ **This file will delete in 2 minutes.**"
         
         sent_msg = await client.send_cached_media(
             chat_id=chat_id,
@@ -115,7 +125,7 @@ async def send_file_to_user(client, chat_id, unique_id):
             # Send Reminder & Schedule its deletion too
             rem_msg = await client.send_message(
                 chat_id,
-                f"⏰ **File: {file_data.get('file_name', 'Unknown')}**\nDeleting in 2 mins."
+                f"⏰ **File:** {filename}\nDeleting in 2 mins."
             )
             task_rem = asyncio.create_task(delete_file_after_delay(rem_msg.id, chat_id, 2))
             DELETE_TASKS[rem_msg.id] = task_rem
@@ -136,6 +146,7 @@ async def index_files(client, message):
         filename = getattr(media, "file_name", None)
         if not filename:
             if message.caption:
+                # Try to get filename from first line of caption
                 filename = message.caption.split("\n")[0].strip()
                 if message.video and "." not in filename: filename += ".mp4"
                 elif message.document and "." not in filename: filename += ".mkv"
@@ -147,7 +158,8 @@ async def index_files(client, message):
             "file_size": media.file_size,
             "file_id": media.file_id,
             "unique_id": media.file_unique_id,
-            "caption": message.caption or filename
+            # We save the original caption just in case, but we won't use it for sending
+            "caption": message.caption or filename 
         }
 
         ref = db.reference(f'files/{media.file_unique_id}')
@@ -157,7 +169,7 @@ async def index_files(client, message):
         logger.error(f"Indexing Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. START COMMAND (UPDATED WITH BUTTON)
+# 2. START COMMAND
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
@@ -169,35 +181,32 @@ async def start(client, message):
             await send_file_to_user(client, message.chat.id, unique_id)
             return
 
-    # Button added here
     buttons = [[InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")]]
     
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
         "I am a Movie Search Bot.\n"
-        "You can search for movies in this chat OR in groups.\n\n"
+        "You can search for movies in this chat OR in groups.\n"
+        "You can also use Inline Search (@BotName query).\n\n"
         "Files are auto-deleted after 2 minutes.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # -----------------------------------------------------------------------------
-# 3. SEARCH HANDLER (ADVANCED SEARCH & 10 MIN DELETE)
+# 3. TEXT SEARCH HANDLER
 # -----------------------------------------------------------------------------
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
-    if message.text.startswith("/"): return
+    if message.text.startswith("/") or message.via_bot: return
 
     query = message.text.strip()
-    
-    # In groups, ignore very short queries
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP] and len(query) < 2:
         return
 
     msg = await message.reply_text("⏳ **Searching...**", quote=True)
 
-    # --- SCHEDULE DELETION OF SEARCH RESULT (10 MINUTES) ---
+    # Auto-delete search results after 10 mins
     asyncio.create_task(delete_file_after_delay(msg.id, message.chat.id, 10))
-    # -------------------------------------------------------
 
     try:
         ref = db.reference('files')
@@ -207,7 +216,6 @@ async def search_handler(client, message):
             await msg.edit("❌ Database is empty.")
             return
 
-        # --- ADVANCED SEARCH LOGIC ---
         clean_query = re.sub(r'[._-]', ' ', query).lower()
         query_words = clean_query.split() 
 
@@ -223,9 +231,7 @@ async def search_handler(client, message):
             await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        # Store results
         USER_SEARCHES[message.from_user.id] = results
-        
         await send_results_page(message, msg, page=1, user_id=message.from_user.id)
 
     except Exception as e:
@@ -233,7 +239,61 @@ async def search_handler(client, message):
         await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. PAGINATION & RESULTS DISPLAY (BUTTON REMOVED)
+# 4. INLINE SEARCH HANDLER (NEW)
+# -----------------------------------------------------------------------------
+@app.on_inline_query()
+async def inline_search(client, query):
+    text = query.query.strip().lower()
+    
+    if not text:
+        return
+
+    try:
+        ref = db.reference('files')
+        snapshot = ref.get()
+        
+        if not snapshot:
+            return
+
+        clean_query = re.sub(r'[._-]', ' ', text).lower()
+        query_words = clean_query.split() 
+
+        results = []
+        count = 0
+        
+        for key, val in snapshot.items():
+            # Limit inline results to 50 to prevent lag
+            if count >= 50: break
+            
+            file_name = val.get('file_name', '')
+            clean_filename = re.sub(r'[._-]', ' ', file_name).lower()
+            
+            if all(word in clean_filename for word in query_words):
+                count += 1
+                size = get_size(val.get('file_size', 0))
+                
+                # Clean Caption for Inline Result
+                caption = f"📁 **{file_name}**\n" \
+                          f"📊 Size: {size}\n\n" \
+                          f"⚠️ **Note:** Auto-delete works best via Bot PM."
+
+                results.append(
+                    InlineQueryResultCachedDocument(
+                        id=val['unique_id'],
+                        title=file_name,
+                        document_file_id=val['file_id'],
+                        description=f"Size: {size}",
+                        caption=caption 
+                    )
+                )
+
+        await query.answer(results, cache_time=10)
+
+    except Exception as e:
+        logger.error(f"Inline Error: {e}")
+
+# -----------------------------------------------------------------------------
+# 5. PAGINATION & RESULTS DISPLAY
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1, user_id=None):
     results = USER_SEARCHES.get(user_id)
@@ -249,7 +309,6 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
 
     buttons = []
     
-    # Check Context
     is_group = message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]
 
     for file in current_files:
@@ -260,11 +319,11 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
         btn_text = f"[{size}] {name}"
         
         if is_group:
-            # GROUP: Deep Link
+            # GROUP: Deep Link to PM
             url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
             buttons.append([InlineKeyboardButton(btn_text, url=url)])
         else:
-            # PRIVATE: Callback
+            # PRIVATE: Callback (Direct Send)
             buttons.append([InlineKeyboardButton(btn_text, callback_data=f"dl|{file['unique_id']}")])
 
     nav = []
@@ -276,7 +335,6 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
     
     if nav: buttons.append(nav)
     
-    # Close Button
     buttons.append([InlineKeyboardButton("❌ Close", callback_data=f"close|{user_id}")])
 
     try:
@@ -292,7 +350,7 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
     await editable_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 # -----------------------------------------------------------------------------
-# 5. CALLBACK HANDLER
+# 6. CALLBACK HANDLER
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -328,7 +386,7 @@ async def callback_handler(client, cb):
         logger.error(f"Callback Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 6. MAIN
+# 7. MAIN
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
     for task in DELETE_TASKS.values():
