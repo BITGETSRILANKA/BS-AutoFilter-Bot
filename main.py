@@ -25,7 +25,7 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("MnSearchBot")
+logger = logging.getLogger("BSFilterBot")
 
 # --- SETUP FIREBASE ---
 if not firebase_admin._apps:
@@ -63,7 +63,7 @@ def run_http_server():
     finally: server.server_close()
 
 # --- SETUP BOT ---
-app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
@@ -166,7 +166,7 @@ async def index_files(client, message):
         logger.error(f"Indexing Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. START COMMAND (UPDATED)
+# 2. START COMMAND
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
@@ -178,7 +178,6 @@ async def start(client, message):
             await send_file_to_user(client, message.chat.id, unique_id)
             return
 
-    # --- BUTTONS ---
     buttons = [
         [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
         [InlineKeyboardButton("🔎 Go Inline Here", switch_inline_query_current_chat="")]
@@ -186,7 +185,7 @@ async def start(client, message):
     
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
-        "I am a Movie Search Bot.\n"
+        "I am BSFilterBot.\n"
         "You can search for movies in this chat OR in groups.\n"
         "You can also use Inline Search (@BotName query).\n\n"
         "Files are auto-deleted after 2 minutes.",
@@ -194,20 +193,28 @@ async def start(client, message):
     )
 
 # -----------------------------------------------------------------------------
-# 3. TEXT SEARCH HANDLER
+# 3. TEXT SEARCH HANDLER (AUTO DELETE USER MSG)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
     if message.text.startswith("/") or message.via_bot: return
 
     query = message.text.strip()
-    if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP] and len(query) < 2:
+    is_group = message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]
+
+    if is_group and len(query) < 2:
         return
 
     msg = await message.reply_text("⏳ **Searching...**", quote=True)
 
-    # Auto-delete search results after 10 mins
+    # --- AUTO DELETE LOGIC ---
+    # 1. Delete Bot's Reply after 10 mins
     asyncio.create_task(delete_file_after_delay(msg.id, message.chat.id, 10))
+    
+    # 2. Delete User's Request Message after 10 mins (Only in Groups)
+    if is_group:
+        asyncio.create_task(delete_file_after_delay(message.id, message.chat.id, 10))
+    # -------------------------
 
     try:
         ref = db.reference('files')
