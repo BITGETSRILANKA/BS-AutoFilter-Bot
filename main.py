@@ -108,9 +108,11 @@ async def send_file_to_user(client, chat_id, unique_id):
         )
 
         if sent_msg:
+            # Schedule File Deletion (2 Minutes)
             task = asyncio.create_task(delete_file_after_delay(sent_msg.id, chat_id, 2))
             DELETE_TASKS[sent_msg.id] = task
             
+            # Send Reminder & Schedule its deletion too
             rem_msg = await client.send_message(
                 chat_id,
                 f"⏰ **File: {file_data.get('file_name', 'Unknown')}**\nDeleting in 2 mins."
@@ -189,6 +191,10 @@ async def search_handler(client, message):
 
     msg = await message.reply_text("⏳ **Searching...**", quote=True)
 
+    # --- NEW: SCHEDULE DELETION OF SEARCH RESULT (10 MINUTES) ---
+    asyncio.create_task(delete_file_after_delay(msg.id, message.chat.id, 10))
+    # ------------------------------------------------------------
+
     try:
         ref = db.reference('files')
         snapshot = ref.get()
@@ -198,19 +204,17 @@ async def search_handler(client, message):
             return
 
         # --- ADVANCED SEARCH LOGIC ---
-        # 1. Clean the query: replace dots, underscores, hyphens with space, make lowercase
+        # 1. Clean the query
         clean_query = re.sub(r'[._-]', ' ', query).lower()
-        query_words = clean_query.split() # Split into list of words
+        query_words = clean_query.split() 
 
         results = []
         for key, val in snapshot.items():
             file_name = val.get('file_name', '')
-            
-            # 2. Clean the filename for comparison
+            # 2. Clean the filename
             clean_filename = re.sub(r'[._-]', ' ', file_name).lower()
             
             # 3. Check if ALL words in query exist in filename
-            # e.g., "stranger things" will match "Stranger_Things_S01.mkv"
             if all(word in clean_filename for word in query_words):
                 results.append(val)
         
@@ -218,10 +222,9 @@ async def search_handler(client, message):
             await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        # Store results mapped to USER ID
+        # Store results
         USER_SEARCHES[message.from_user.id] = results
         
-        # Call pagination with explicit user_id
         await send_results_page(message, msg, page=1, user_id=message.from_user.id)
 
     except Exception as e:
@@ -232,7 +235,6 @@ async def search_handler(client, message):
 # 4. PAGINATION & RESULTS DISPLAY
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1, user_id=None):
-    # Retrieve results for the specific user
     results = USER_SEARCHES.get(user_id)
 
     if not results:
@@ -246,8 +248,7 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
 
     buttons = []
     
-    # Check if we are in a group based on the message that triggered this
-    # If called from Callback, message is the bot's message.
+    # Check Context
     is_group = message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]
 
     for file in current_files:
@@ -274,10 +275,14 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
     
     if nav: buttons.append(nav)
     
-    # Add Close Button
+    # Close Button
     buttons.append([InlineKeyboardButton("❌ Close", callback_data=f"close|{user_id}")])
 
-    # Get User Mention (Safely)
+    # --- NEW: ADD TO GROUP BUTTON ---
+    add_group_url = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+    buttons.append([InlineKeyboardButton("➕ Add Me To Your Group", url=add_group_url)])
+    # -------------------------------
+
     try:
         user = await app.get_users(user_id)
         mention = user.mention
@@ -307,9 +312,8 @@ async def callback_handler(client, cb):
             page_num = int(data[1])
             target_user_id = int(data[2])
 
-            # Security: Only allow the person who searched to use Next/Back
             if cb.from_user.id != target_user_id:
-                await cb.answer("⚠️ These aren't your results! Search for the movie yourself.", show_alert=True)
+                await cb.answer("⚠️ These aren't your results!", show_alert=True)
                 return
 
             await send_results_page(cb.message, cb.message, page=page_num, user_id=target_user_id)
@@ -346,7 +350,6 @@ def main():
         BOT_USERNAME = me.username
         logger.info(f"🤖 Bot Username: @{BOT_USERNAME}")
         
-        # Keep bot running
         import signal
         idle_event = asyncio.Event()
         loop = asyncio.get_event_loop()
@@ -356,7 +359,6 @@ def main():
             pass
             
     except Exception as e:
-        # Fallback for idle
         from pyrogram import idle
         idle()
     finally:
