@@ -157,7 +157,7 @@ async def index_files(client, message):
         logger.error(f"Indexing Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. START COMMAND (HANDLES DEEP LINKS)
+# 2. START COMMAND (UPDATED WITH BUTTON)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
@@ -169,15 +169,19 @@ async def start(client, message):
             await send_file_to_user(client, message.chat.id, unique_id)
             return
 
+    # Button added here
+    buttons = [[InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")]]
+    
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
         "I am a Movie Search Bot.\n"
         "You can search for movies in this chat OR in groups.\n\n"
-        "Files are auto-deleted after 2 minutes."
+        "Files are auto-deleted after 2 minutes.",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # -----------------------------------------------------------------------------
-# 3. SEARCH HANDLER (ADVANCED SEARCH)
+# 3. SEARCH HANDLER (ADVANCED SEARCH & 10 MIN DELETE)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
@@ -191,9 +195,9 @@ async def search_handler(client, message):
 
     msg = await message.reply_text("⏳ **Searching...**", quote=True)
 
-    # --- NEW: SCHEDULE DELETION OF SEARCH RESULT (10 MINUTES) ---
+    # --- SCHEDULE DELETION OF SEARCH RESULT (10 MINUTES) ---
     asyncio.create_task(delete_file_after_delay(msg.id, message.chat.id, 10))
-    # ------------------------------------------------------------
+    # -------------------------------------------------------
 
     try:
         ref = db.reference('files')
@@ -204,17 +208,14 @@ async def search_handler(client, message):
             return
 
         # --- ADVANCED SEARCH LOGIC ---
-        # 1. Clean the query
         clean_query = re.sub(r'[._-]', ' ', query).lower()
         query_words = clean_query.split() 
 
         results = []
         for key, val in snapshot.items():
             file_name = val.get('file_name', '')
-            # 2. Clean the filename
             clean_filename = re.sub(r'[._-]', ' ', file_name).lower()
             
-            # 3. Check if ALL words in query exist in filename
             if all(word in clean_filename for word in query_words):
                 results.append(val)
         
@@ -232,7 +233,7 @@ async def search_handler(client, message):
         await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. PAGINATION & RESULTS DISPLAY
+# 4. PAGINATION & RESULTS DISPLAY (BUTTON REMOVED)
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1, user_id=None):
     results = USER_SEARCHES.get(user_id)
@@ -277,11 +278,6 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
     
     # Close Button
     buttons.append([InlineKeyboardButton("❌ Close", callback_data=f"close|{user_id}")])
-
-    # --- NEW: ADD TO GROUP BUTTON ---
-    add_group_url = f"https://t.me/{BOT_USERNAME}?startgroup=true"
-    buttons.append([InlineKeyboardButton("➕ Add Me To Your Group", url=add_group_url)])
-    # -------------------------------
 
     try:
         user = await app.get_users(user_id)
