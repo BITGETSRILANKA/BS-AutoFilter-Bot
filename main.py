@@ -22,8 +22,11 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", ""))
 
 # Add these new configurations
 ADMIN_IDS = list(map(int, os.environ.get("ADMIN_IDS", "").split(','))) if os.environ.get("ADMIN_IDS") else []
-FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "")  # Channel username without @
+FORCE_SUB_CHANNEL_ID = int(os.environ.get("FORCE_SUB_CHANNEL_ID", 0))  # Channel ID for force subscription
 RESULTS_PER_PAGE = 10
+
+# Store channel info
+CHANNEL_INFO = {}
 
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -74,6 +77,8 @@ app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 # --- GLOBAL STORAGE ---
 USER_SEARCHES = {}
 DELETE_TASKS = {}
+# Track group messages to prevent spam
+GROUP_SEARCH_COOLDOWN = {}
 
 # --- HELPER FUNCTIONS ---
 def get_size(size):
@@ -85,39 +90,66 @@ def get_size(size):
         i += 1
     return f"{size:.2f} {units[i]}"
 
+async def get_channel_info(channel_id):
+    """Get channel info and cache it"""
+    if channel_id not in CHANNEL_INFO:
+        try:
+            chat = await app.get_chat(channel_id)
+            invite_link = await app.create_chat_invite_link(
+                chat_id=channel_id,
+                creates_join_request=True
+            )
+            CHANNEL_INFO[channel_id] = {
+                'title': chat.title,
+                'username': chat.username,
+                'invite_link': invite_link.invite_link
+            }
+            logger.info(f"✅ Got channel info for {chat.title}")
+        except Exception as e:
+            logger.error(f"❌ Error getting channel info: {e}")
+            CHANNEL_INFO[channel_id] = {
+                'title': "Our Channel",
+                'username': None,
+                'invite_link': f"https://t.me/c/{str(channel_id).replace('-100', '')}"
+            }
+    return CHANNEL_INFO[channel_id]
+
 async def force_sub_check(user_id):
     """Check if user is subscribed to force subscription channel"""
-    if not FORCE_SUB_CHANNEL:
+    if not FORCE_SUB_CHANNEL_ID:
         return True
     
     try:
-        user = await app.get_chat_member(FORCE_SUB_CHANNEL, user_id)
+        user = await app.get_chat_member(FORCE_SUB_CHANNEL_ID, user_id)
         if user.status not in ["left", "kicked", "banned"]:
             return True
     except UserNotParticipant:
         pass
     except Exception as e:
-        logger.error(f"Force sub check error: {e}")
+        logger.error(f"Force sub check error for user {user_id}: {e}")
     
     return False
 
 async def send_force_sub_message(chat_id, user_id):
-    """Send force subscription message"""
+    """Send force subscription message with channel link"""
+    channel_info = await get_channel_info(FORCE_SUB_CHANNEL_ID)
+    
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_SUB_CHANNEL}"),
+        InlineKeyboardButton("📢 Join Channel", url=channel_info['invite_link']),
         InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub|{user_id}")
     ]])
     
     message = await app.send_message(
         chat_id,
         f"⚠️ **Please join our channel to use this bot**\n\n"
-        f"Join: @{FORCE_SUB_CHANNEL}\n"
-        f"Then click 'Try Again'",
+        f"**Channel:** {channel_info['title']}\n"
+        f"Click the button below to join, then click 'Try Again'",
         reply_markup=keyboard
     )
     
     # Delete after 2 minutes
     asyncio.create_task(delete_message_delayed(message.id, chat_id, 120))
+    return message
 
 async def delete_message_delayed(message_id, chat_id, delay_seconds=120):
     """Delete a message after specified delay"""
@@ -126,6 +158,47 @@ async def delete_message_delayed(message_id, chat_id, delay_seconds=120):
         await app.delete_messages(chat_id, message_id)
     except:
         pass
+
+def is_valid_movie_query(text):
+    """
+    Check if text looks like a movie name query
+    Filters out short texts, commands, and common non-movie messages
+    """
+    # Remove extra spaces and normalize
+    text = text.strip()
+    
+    # Check minimum length (at least 3 characters)
+    if len(text) < 3:
+        return False
+    
+    # Check maximum length (movies rarely have names longer than 50 chars)
+    if len(text) > 50:
+        return False
+    
+    # Ignore if it's a command
+    if text.startswith('/'):
+        return False
+    
+    # Ignore if it's a mention
+    if '@' in text and any(word in text.lower() for word in ['@admin', '@admins', '@mod', '@moderator']):
+        return False
+    
+    # Ignore common chat phrases (case insensitive)
+    ignore_phrases = [
+        'ok', 'okay', 'yes', 'no', 'thanks', 'thank you', 'hi', 'hello', 'hey',
+        'bye', 'good morning', 'good night', 'lol', 'haha', 'wow', 'omg',
+        'please', 'sorry', 'welcome', 'how are you', 'whats up', 'sup',
+        'good', 'bad', 'nice', 'cool', 'awesome', 'great', 'perfect'
+    ]
+    
+    if text.lower() in ignore_phrases:
+        return False
+    
+    # Check if it looks like a typical movie name (contains at least one letter)
+    if not any(c.isalpha() for c in text):
+        return False
+    
+    return True
 
 # --- AUTO DELETE FUNCTION ---
 async def delete_file_after_delay(message_id, chat_id, delay_minutes=2):
@@ -182,7 +255,8 @@ async def index_files(client, message):
             "unique_id": media.file_unique_id,
             "caption": message.caption or filename,
             "message_id": message.id,
-            "channel_id": CHANNEL_ID
+            "channel_id": CHANNEL_ID,
+            "timestamp": datetime.now().isoformat()
         }
 
         ref = db.reference(f'files/{media.file_unique_id}')
@@ -194,7 +268,33 @@ async def index_files(client, message):
         logger.error(f"❌ Error indexing file: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. COMMANDS - WORK IN BOTH PRIVATE AND GROUPS
+# 2. BOT STARTUP - GET CHANNEL INFO
+# -----------------------------------------------------------------------------
+@app.on_raw_update()
+async def handle_raw_update(client, update, users, chats):
+    pass
+
+async def startup_tasks():
+    """Run startup tasks"""
+    # Get force sub channel info if configured
+    if FORCE_SUB_CHANNEL_ID:
+        try:
+            await get_channel_info(FORCE_SUB_CHANNEL_ID)
+            logger.info(f"✅ Force sub channel: {CHANNEL_INFO[FORCE_SUB_CHANNEL_ID]['title']}")
+        except Exception as e:
+            logger.error(f"❌ Error getting force sub channel info: {e}")
+    
+    # Get bot channel info
+    try:
+        await get_channel_info(CHANNEL_ID)
+        logger.info(f"✅ Bot channel: {CHANNEL_INFO[CHANNEL_ID]['title']}")
+    except Exception as e:
+        logger.error(f"❌ Error getting bot channel info: {e}")
+    
+    logger.info("🤖 Bot is ready!")
+
+# -----------------------------------------------------------------------------
+# 3. COMMANDS - WORK IN BOTH PRIVATE AND GROUPS
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start"))
 async def start(client, message):
@@ -202,8 +302,17 @@ async def start(client, message):
     chat_type = message.chat.type
     
     # Check force subscription
-    if not await force_sub_check(user_id):
-        await send_force_sub_message(message.chat.id, user_id)
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
+        channel_info = await get_channel_info(FORCE_SUB_CHANNEL_ID)
+        await message.reply_text(
+            f"👋 **Welcome {message.from_user.first_name}!**\n\n"
+            f"⚠️ **To use this bot, please join our channel first:**\n"
+            f"**Channel:** {channel_info['title']}\n\n"
+            f"After joining, click /start again.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📢 Join Channel", url=channel_info['invite_link'])
+            ]])
+        )
         return
     
     welcome_text = f"👋 **Hey {message.from_user.first_name}!**\n"
@@ -213,9 +322,10 @@ async def start(client, message):
     else:
         welcome_text += (
             "I'm a movie search bot!\n"
-            "**How to use in group:**\n"
-            "• Tag me with a movie name: `@botname movie_name`\n"
+            "**How to use:**\n"
+            "• Just send a movie name (e.g., `Men In Black`)\n"
             "• Or use command: `/search movie_name`\n\n"
+            "**Auto-search is enabled!** Just type movie names normally.\n\n"
         )
     
     welcome_text += "⚠️ **Note:** Downloaded files are sent to your PM and auto-delete after 2 minutes."
@@ -226,7 +336,7 @@ async def start(client, message):
 async def help_command(client, message):
     user_id = message.from_user.id
     
-    if not await force_sub_check(user_id):
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
         await send_force_sub_message(message.chat.id, user_id)
         return
     
@@ -235,8 +345,11 @@ async def help_command(client, message):
         "**In Private Chat:**\n"
         "• Just send a movie name to search\n\n"
         "**In Groups:**\n"
-        "• Tag me with movie name: `@botname movie_name`\n"
-        "• Use command: `/search movie_name`\n\n"
+        "• Send movie name directly (e.g., `Avengers Endgame`)\n"
+        "• Or use command: `/search movie_name`\n"
+        "• Or mention: `@botname movie_name`\n\n"
+        "**Auto-Search Feature:**\n"
+        "In groups, just type movie names normally. The bot will automatically search!\n\n"
         "**Features:**\n"
         "• Click on files to download\n"
         "• Use pagination buttons\n"
@@ -252,7 +365,7 @@ async def search_in_group(client, message):
     user_id = message.from_user.id
     
     # Check force subscription
-    if not await force_sub_check(user_id):
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
         await send_force_sub_message(message.chat.id, user_id)
         return
     
@@ -263,19 +376,58 @@ async def search_in_group(client, message):
     query = " ".join(message.command[1:])
     await perform_search(message, query, is_group=True)
 
-# Handle mentions in groups
+# -----------------------------------------------------------------------------
+# 4. MAIN FEATURE: AUTO-SEARCH ON MOVIE NAMES IN GROUPS
+# -----------------------------------------------------------------------------
+@app.on_message(filters.group & filters.text)
+async def auto_search_movie(client, message):
+    """
+    Automatically search when someone sends a movie name in group
+    """
+    # Skip if message is from bot
+    if message.from_user and message.from_user.is_bot:
+        return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Check if it's a valid movie query
+    if not is_valid_movie_query(message.text):
+        return
+    
+    # Cooldown check to prevent spam (5 seconds per user per group)
+    cooldown_key = f"{chat_id}_{user_id}"
+    current_time = time.time()
+    if cooldown_key in GROUP_SEARCH_COOLDOWN:
+        if current_time - GROUP_SEARCH_COOLDOWN[cooldown_key] < 5:
+            return
+    
+    # Check force subscription
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
+        # Only send force sub message for valid queries
+        await send_force_sub_message(chat_id, user_id)
+        return
+    
+    # Update cooldown
+    GROUP_SEARCH_COOLDOWN[cooldown_key] = current_time
+    
+    # Perform search
+    query = message.text.strip()
+    await perform_search(message, query, is_group=True)
+
+# Handle mentions in groups (still works as before)
 @app.on_message(filters.group & filters.mentioned)
 async def handle_mention(client, message):
     user_id = message.from_user.id
     
-    if not await force_sub_check(user_id):
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
         await send_force_sub_message(message.chat.id, user_id)
         return
     
     # Extract query from mention
     query = message.text.replace(f"@{client.me.username}", "").strip()
     
-    if query:
+    if query and is_valid_movie_query(query):
         await perform_search(message, query, is_group=True)
 
 # Handle text in private chat
@@ -283,18 +435,26 @@ async def handle_mention(client, message):
 async def search_in_private(client, message):
     user_id = message.from_user.id
     
-    if not await force_sub_check(user_id):
+    if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
         await send_force_sub_message(message.chat.id, user_id)
         return
     
     query = message.text.strip()
-    await perform_search(message, query, is_group=False)
+    if is_valid_movie_query(query):
+        await perform_search(message, query, is_group=False)
+    else:
+        # If it's not a movie query, send help
+        await message.reply_text(
+            "Please send a movie name to search.\n"
+            "Example: `Men In Black`, `Avengers Endgame`, `John Wick 4`\n\n"
+            "Or use /help for more information."
+        )
 
 # -----------------------------------------------------------------------------
-# 3. SEARCH FUNCTIONALITY
+# 5. SEARCH FUNCTIONALITY
 # -----------------------------------------------------------------------------
 async def perform_search(message, query, is_group=False):
-    search_msg = await message.reply_text("⏳ **Searching...**")
+    search_msg = await message.reply_text(f"🔍 **Searching for:** `{query}`")
     
     try:
         ref = db.reference('files')
@@ -324,7 +484,7 @@ async def perform_search(message, query, is_group=False):
         await search_msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. PAGINATION
+# 6. PAGINATION
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1, is_group=False):
     user_id = message.from_user.id
@@ -369,14 +529,14 @@ async def send_results_page(message, editable_msg, page=1, is_group=False):
         ])
 
     await editable_msg.edit_text(
-        f"🎬 **Found {total_results} Files for: `{message.text if hasattr(message, 'text') else 'Search'}`**\n"
+        f"🎬 **Found {total_results} Files for:** `{query if hasattr(message, 'text') else 'Search'}`\n"
         f"👇 Click to download (will be sent to your PM):\n\n"
         f"⚠️ **Note:** Files auto-delete in 2 minutes",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # -----------------------------------------------------------------------------
-# 5. CALLBACK HANDLERS
+# 7. CALLBACK HANDLERS
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -394,9 +554,18 @@ async def callback_handler(client, cb):
                 return
             
             # Check force subscription
-            if not await force_sub_check(user_id):
+            if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
                 await cb.answer("Please join the channel first!", show_alert=True)
-                await send_force_sub_message(cb.message.chat.id, user_id)
+                channel_info = await get_channel_info(FORCE_SUB_CHANNEL_ID)
+                await cb.message.reply_text(
+                    f"⚠️ **Please join our channel to download files**\n\n"
+                    f"**Channel:** {channel_info['title']}\n"
+                    f"Join and try again.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📢 Join Channel", url=channel_info['invite_link'])
+                    ]]),
+                    reply_to_message_id=cb.message.id
+                )
                 return
             
             ref = db.reference(f'files/{unique_id}')
@@ -463,7 +632,7 @@ async def callback_handler(client, cb):
                 return
             
             # Check force subscription
-            if not await force_sub_check(user_id):
+            if FORCE_SUB_CHANNEL_ID and not await force_sub_check(user_id):
                 await cb.answer("Please join the channel first!", show_alert=True)
                 await send_force_sub_message(cb.message.chat.id, user_id)
                 return
@@ -497,7 +666,7 @@ async def callback_handler(client, cb):
         logger.error(f"Callback Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 6. ADMIN COMMANDS
+# 8. ADMIN COMMANDS
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("stats") & filters.user(ADMIN_IDS))
 async def stats_command(client, message):
@@ -506,8 +675,14 @@ async def stats_command(client, message):
         snapshot = ref.get()
         total_files = len(snapshot) if snapshot else 0
         
+        force_sub_info = ""
+        if FORCE_SUB_CHANNEL_ID:
+            channel_info = await get_channel_info(FORCE_SUB_CHANNEL_ID)
+            force_sub_info = f"• Force sub channel: `{channel_info['title']}`\n"
+        
         await message.reply_text(
             f"📊 **Bot Statistics**\n\n"
+            f"{force_sub_info}"
             f"• Total files indexed: `{total_files}`\n"
             f"• Active delete tasks: `{len(DELETE_TASKS)}`\n"
             f"• Active searches: `{len(USER_SEARCHES)}`\n"
@@ -529,8 +704,29 @@ async def broadcast_command(client, message):
     # For now, this just sends to the current chat
     await message.reply_text(f"📢 **Broadcast:**\n\n{broadcast_text}")
 
+@app.on_message(filters.command("getlink") & filters.user(ADMIN_IDS))
+async def get_channel_link(client, message):
+    """Get invite link for force sub channel"""
+    if not FORCE_SUB_CHANNEL_ID:
+        await message.reply_text("❌ Force sub channel not configured.")
+        return
+    
+    try:
+        channel_info = await get_channel_info(FORCE_SUB_CHANNEL_ID)
+        await message.reply_text(
+            f"📢 **Channel Info:**\n\n"
+            f"**Title:** {channel_info['title']}\n"
+            f"**Username:** @{channel_info['username'] if channel_info['username'] else 'No Username'}\n"
+            f"**ID:** `{FORCE_SUB_CHANNEL_ID}`\n\n"
+            f"**Invite Link:**\n`{channel_info['invite_link']}`",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Get link error: {e}")
+        await message.reply_text(f"❌ Error: {e}")
+
 # -----------------------------------------------------------------------------
-# 7. BOT MANAGEMENT
+# 9. BOT MANAGEMENT
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
     """Cancel all pending delete tasks when bot stops"""
@@ -543,6 +739,9 @@ async def cancel_all_delete_tasks():
             pass
     DELETE_TASKS.clear()
 
+# Import time for cooldown
+import time
+
 def main():
     # Start HTTP server in a separate thread
     http_thread = threading.Thread(target=run_http_server, daemon=True)
@@ -552,7 +751,9 @@ def main():
     print("🤖 Bot Started...")
     print(f"👤 Bot Username: @{app.me.username}")
     print(f"📊 Admin IDs: {ADMIN_IDS}")
-    print(f"📢 Force Sub: {FORCE_SUB_CHANNEL}")
+    print(f"📢 Force Sub Channel ID: {FORCE_SUB_CHANNEL_ID}")
+    print("\n🎬 **Auto-search is ENABLED!**")
+    print("Users can just type movie names in groups!")
     
     try:
         app.run()
