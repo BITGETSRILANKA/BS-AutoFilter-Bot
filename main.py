@@ -103,7 +103,6 @@ async def send_file_to_user(client, chat_id, unique_id):
             return
 
         # --- CLEAN CAPTION LOGIC ---
-        # We ignore the original caption and build a clean one
         filename = file_data.get('file_name', 'Unknown File')
         size = get_size(file_data.get('file_size', 0))
         
@@ -146,7 +145,6 @@ async def index_files(client, message):
         filename = getattr(media, "file_name", None)
         if not filename:
             if message.caption:
-                # Try to get filename from first line of caption
                 filename = message.caption.split("\n")[0].strip()
                 if message.video and "." not in filename: filename += ".mp4"
                 elif message.document and "." not in filename: filename += ".mkv"
@@ -158,7 +156,6 @@ async def index_files(client, message):
             "file_size": media.file_size,
             "file_id": media.file_id,
             "unique_id": media.file_unique_id,
-            # We save the original caption just in case, but we won't use it for sending
             "caption": message.caption or filename 
         }
 
@@ -169,7 +166,7 @@ async def index_files(client, message):
         logger.error(f"Indexing Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 2. START COMMAND
+# 2. START COMMAND (UPDATED)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
@@ -181,7 +178,11 @@ async def start(client, message):
             await send_file_to_user(client, message.chat.id, unique_id)
             return
 
-    buttons = [[InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")]]
+    # --- BUTTONS ---
+    buttons = [
+        [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
+        [InlineKeyboardButton("🔎 Go Inline Here", switch_inline_query_current_chat="")]
+    ]
     
     await message.reply_text(
         f"👋 **Hey {message.from_user.first_name}!**\n"
@@ -239,7 +240,7 @@ async def search_handler(client, message):
         await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. INLINE SEARCH HANDLER (NEW)
+# 4. INLINE SEARCH HANDLER
 # -----------------------------------------------------------------------------
 @app.on_inline_query()
 async def inline_search(client, query):
@@ -262,7 +263,6 @@ async def inline_search(client, query):
         count = 0
         
         for key, val in snapshot.items():
-            # Limit inline results to 50 to prevent lag
             if count >= 50: break
             
             file_name = val.get('file_name', '')
@@ -272,7 +272,6 @@ async def inline_search(client, query):
                 count += 1
                 size = get_size(val.get('file_size', 0))
                 
-                # Clean Caption for Inline Result
                 caption = f"📁 **{file_name}**\n" \
                           f"📊 Size: {size}\n\n" \
                           f"⚠️ **Note:** Auto-delete works best via Bot PM."
