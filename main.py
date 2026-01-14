@@ -4,10 +4,10 @@ import math
 import logging
 import asyncio
 import threading
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import MessageDeleteForbidden
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -65,7 +65,7 @@ app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 USER_SEARCHES = {}
 RESULTS_PER_PAGE = 10
 DELETE_TASKS = {}
-BOT_USERNAME = "" # Will be set on startup
+BOT_USERNAME = "" 
 
 # --- HELPER: Size ---
 def get_size(size):
@@ -107,12 +107,10 @@ async def send_file_to_user(client, chat_id, unique_id):
             caption=caption
         )
 
-        # Schedule Deletion
         if sent_msg:
             task = asyncio.create_task(delete_file_after_delay(sent_msg.id, chat_id, 2))
             DELETE_TASKS[sent_msg.id] = task
             
-            # Reminder
             rem_msg = await client.send_message(
                 chat_id,
                 f"⏰ **File: {file_data.get('file_name', 'Unknown')}**\nDeleting in 2 mins."
@@ -161,7 +159,6 @@ async def index_files(client, message):
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
-    # Check if there is a payload (e.g. /start dl_UNIQUEID)
     if len(message.command) > 1:
         data = message.command[1]
         if data.startswith("dl_"):
@@ -178,17 +175,15 @@ async def start(client, message):
     )
 
 # -----------------------------------------------------------------------------
-# 3. SEARCH HANDLER (PRIVATE & GROUPS)
+# 3. SEARCH HANDLER (ADVANCED SEARCH)
 # -----------------------------------------------------------------------------
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
-    # Ignore commands (starting with /) to prevent conflict unless it's strictly a text search bot
-    if message.text.startswith("/"):
-        return
+    if message.text.startswith("/"): return
 
-    query = message.text.strip().lower()
+    query = message.text.strip()
     
-    # In groups, maybe ignore very short messages to reduce spam
+    # In groups, ignore very short queries
     if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP] and len(query) < 2:
         return
 
@@ -202,19 +197,32 @@ async def search_handler(client, message):
             await msg.edit("❌ Database is empty.")
             return
 
+        # --- ADVANCED SEARCH LOGIC ---
+        # 1. Clean the query: replace dots, underscores, hyphens with space, make lowercase
+        clean_query = re.sub(r'[._-]', ' ', query).lower()
+        query_words = clean_query.split() # Split into list of words
+
         results = []
         for key, val in snapshot.items():
-            f_name = val.get('file_name', '').lower().replace(".", " ")
-            if query in f_name:
+            file_name = val.get('file_name', '')
+            
+            # 2. Clean the filename for comparison
+            clean_filename = re.sub(r'[._-]', ' ', file_name).lower()
+            
+            # 3. Check if ALL words in query exist in filename
+            # e.g., "stranger things" will match "Stranger_Things_S01.mkv"
+            if all(word in clean_filename for word in query_words):
                 results.append(val)
         
         if not results:
             await msg.edit(f"❌ No results found for: `{query}`")
             return
 
-        # Store results for this specific user to handle pagination
+        # Store results mapped to USER ID
         USER_SEARCHES[message.from_user.id] = results
-        await send_results_page(message, msg, page=1)
+        
+        # Call pagination with explicit user_id
+        await send_results_page(message, msg, page=1, user_id=message.from_user.id)
 
     except Exception as e:
         logger.error(f"Search Error: {e}")
@@ -223,12 +231,12 @@ async def search_handler(client, message):
 # -----------------------------------------------------------------------------
 # 4. PAGINATION & RESULTS DISPLAY
 # -----------------------------------------------------------------------------
-async def send_results_page(message, editable_msg, page=1):
-    user_id = message.from_user.id
+async def send_results_page(message, editable_msg, page=1, user_id=None):
+    # Retrieve results for the specific user
     results = USER_SEARCHES.get(user_id)
 
     if not results:
-        await editable_msg.edit("⚠️ Session expired or results cleared. Search again.")
+        await editable_msg.edit("⚠️ Session expired. Please search again.")
         return
 
     total_results = len(results)
@@ -238,7 +246,8 @@ async def send_results_page(message, editable_msg, page=1):
 
     buttons = []
     
-    # Determine Context (Are we in a Group or Private?)
+    # Check if we are in a group based on the message that triggered this
+    # If called from Callback, message is the bot's message.
     is_group = message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]
 
     for file in current_files:
@@ -249,23 +258,33 @@ async def send_results_page(message, editable_msg, page=1):
         btn_text = f"[{size}] {name}"
         
         if is_group:
-            # GROUP: Use Deep Link (Send to PM)
-            # Link format: t.me/BotUsername?start=dl_UNIQUEID
+            # GROUP: Deep Link
             url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
             buttons.append([InlineKeyboardButton(btn_text, url=url)])
         else:
-            # PRIVATE: Direct Download Callback
+            # PRIVATE: Callback
             buttons.append([InlineKeyboardButton(btn_text, callback_data=f"dl|{file['unique_id']}")])
 
     nav = []
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}|{user_id}"))
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
     if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}|{user_id}"))
+    
     if nav: buttons.append(nav)
+    
+    # Add Close Button
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data=f"close|{user_id}")])
 
-    text = f"🎬 **Found {total_results} Files** for user {message.from_user.mention}\n" \
+    # Get User Mention (Safely)
+    try:
+        user = await app.get_users(user_id)
+        mention = user.mention
+    except:
+        mention = "User"
+
+    text = f"🎬 **Found {total_results} Files** for {mention}\n" \
            f"👇 Click to get file in PM:" if is_group else \
            f"🎬 **Found {total_results} Files**\n👇 Click to download:"
 
@@ -281,16 +300,26 @@ async def callback_handler(client, cb):
         action = data[0]
 
         if action == "dl":
-            # This only happens in Private Chat now
             await cb.answer("📂 Sending file...")
             await send_file_to_user(client, cb.message.chat.id, data[1])
 
         elif action == "page":
-            # Verify if the user clicking is the one who searched
-            if cb.from_user.id not in USER_SEARCHES:
-                await cb.answer("⚠️ These are not your search results. Please search yourself.", show_alert=True)
+            page_num = int(data[1])
+            target_user_id = int(data[2])
+
+            # Security: Only allow the person who searched to use Next/Back
+            if cb.from_user.id != target_user_id:
+                await cb.answer("⚠️ These aren't your results! Search for the movie yourself.", show_alert=True)
                 return
-            await send_results_page(cb, cb.message, page=int(data[1]))
+
+            await send_results_page(cb.message, cb.message, page=page_num, user_id=target_user_id)
+
+        elif action == "close":
+            target_user_id = int(data[1])
+            if cb.from_user.id != target_user_id:
+                await cb.answer("⚠️ Only the searcher can close this.", show_alert=True)
+                return
+            await cb.message.delete()
 
         elif action == "noop":
             await cb.answer("Current Page")
@@ -312,23 +341,22 @@ def main():
     print("Bot Started...")
     try:
         app.start()
-        # Get Bot Username for Deep Linking
         global BOT_USERNAME
         me = app.get_me()
         BOT_USERNAME = me.username
         logger.info(f"🤖 Bot Username: @{BOT_USERNAME}")
         
+        # Keep bot running
         import signal
         idle_event = asyncio.Event()
-        
-        # Simple idle loop
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(idle_event.wait())
-        
-    except KeyboardInterrupt:
-        pass
+        try:
+            loop.run_until_complete(idle_event.wait())
+        except KeyboardInterrupt:
+            pass
+            
     except Exception as e:
-        # Pyrogram idle() fallback
+        # Fallback for idle
         from pyrogram import idle
         idle()
     finally:
