@@ -292,7 +292,9 @@ async def startup_tasks():
     except Exception as e:
         logger.error(f"❌ Error getting bot channel info: {e}")
     
-    logger.info("🤖 Bot is ready!")
+    # Get bot info
+    me = await app.get_me()
+    logger.info(f"🤖 Bot started: @{me.username}")
 
 # -----------------------------------------------------------------------------
 # 3. COMMANDS - WORK IN BOTH PRIVATE AND GROUPS
@@ -426,7 +428,8 @@ async def handle_mention(client, message):
         return
     
     # Extract query from mention
-    query = message.text.replace(f"@{client.me.username}", "").strip()
+    bot_username = (await app.get_me()).username
+    query = message.text.replace(f"@{bot_username}", "").strip()
     
     if query and is_valid_movie_query(query):
         await perform_search(message, query, is_group=True)
@@ -614,8 +617,9 @@ async def callback_handler(client, cb):
                 # If user hasn't started bot in PM
                 await cb.answer("❌ Please start me in PM first!", show_alert=True)
                 # Send start button
+                me = await app.get_me()
                 keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📩 Start Bot in PM", url=f"https://t.me/{client.me.username}?start=start")
+                    InlineKeyboardButton("📩 Start Bot in PM", url=f"https://t.me/{me.username}?start=start")
                 ]])
                 await cb.message.reply_text(
                     "⚠️ **Please start me in PM first!**\n"
@@ -727,7 +731,16 @@ async def get_channel_link(client, message):
         await message.reply_text(f"❌ Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 9. BOT MANAGEMENT
+# 9. BOT STARTUP HANDLER
+# -----------------------------------------------------------------------------
+@app.on_message(filters.command("restart") & filters.user(ADMIN_IDS))
+async def restart_bot(client, message):
+    await message.reply_text("🔄 Restarting bot...")
+    # This will trigger the bot to restart
+    os._exit(1)
+
+# -----------------------------------------------------------------------------
+# 10. BOT MANAGEMENT
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
     """Cancel all pending delete tasks when bot stops"""
@@ -745,20 +758,35 @@ def main():
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
     
-    # Start the Telegram bot
-    print("🤖 Bot Started...")
-    print(f"👤 Bot Username: @{app.me.username}")
+    # Print startup message
+    print("🤖 Movie Search Bot Starting...")
     print(f"📊 Admin IDs: {ADMIN_IDS}")
     print(f"📢 Force Sub Channel ID: {FORCE_SUB_CHANNEL_ID}")
-    print("\n🎬 **Auto-search is ENABLED!**")
+    print("🎬 **Auto-search is ENABLED!**")
     print("Users can just type movie names in groups!")
     
+    # Start the Telegram bot with error handling
     try:
-        app.run()
+        # Start the bot
+        app.start()
+        
+        # Get bot info after start
+        me = app.get_me()
+        print(f"✅ Bot started successfully: @{me.username}")
+        
+        # Run startup tasks
+        app.run(startup_tasks())
+        
+    except Exception as e:
+        logger.error(f"❌ Bot failed to start: {e}")
+        print(f"❌ Bot failed to start: {e}")
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     finally:
+        # Stop the bot gracefully
+        app.stop()
         asyncio.run(cancel_all_delete_tasks())
+        print("👋 Bot stopped")
 
 if __name__ == "__main__":
     main()
