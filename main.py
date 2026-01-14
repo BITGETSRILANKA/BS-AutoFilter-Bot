@@ -1,204 +1,357 @@
 import os
 import json
+import math
 import logging
 import asyncio
 import threading
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import MessageDeleteForbidden
 import firebase_admin
 from firebase_admin import credentials, db
-from app import run_flask_server
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
-URL = os.environ.get("URL", "") 
 
-# --- LOGGING ---
+# --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("BSAutoFilterBot")
+logger = logging.getLogger("MnSearchBot")
 
-# --- FIREBASE INIT ---
+# --- SETUP FIREBASE ---
 if not firebase_admin._apps:
     try:
-        cred = credentials.Certificate(json.loads(FIREBASE_KEY))
-        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+        if FIREBASE_KEY:
+            cred_dict = json.loads(FIREBASE_KEY)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
+            logger.info("✅ Firebase Initialized Successfully")
+        else:
+            logger.error("❌ FIREBASE_KEY is missing")
     except Exception as e:
-        logger.error(f"Firebase Error: {e}")
+        logger.error(f"❌ Firebase Error: {e}")
 
-# --- BOT SETUP ---
-app = Client("BSAutoFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# --- CUSTOM FILTER (Fail-safe for Web App) ---
-def check_web_app(_, __, message):
-    return bool(message.web_app_data)
-web_filter = filters.create(check_web_app)
-
-# --- KEYBOARDS ---
-def get_start_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📱 Open Movie App", web_app=WebAppInfo(url=URL))],
-        [
-            InlineKeyboardButton("ℹ️ Help", callback_data="help"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats")
-        ]
-    ])
-
-def get_back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data="home")]
-    ])
-
-# --- COMMAND HANDLERS ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(client, message):
-    if not URL.startswith("http"):
-        await message.reply("⚠️ **Config Error:** URL variable is missing in Koyeb.")
-        return
-
-    # 1. Track User (Save ID to Firebase for Stats)
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name
-    try:
-        # We only save the name to avoid huge data. The key is the ID.
-        db.reference(f'users/{user_id}').update({'name': user_name})
-    except Exception as e:
-        logger.error(f"User tracking error: {e}")
-
-    # 2. Send Welcome Message
-    await message.reply_text(
-        f"🎬 **Movie Club**\n\n"
-        f"Hey {message.from_user.first_name}! \n"
-        f"Click the button below to open the library and watch your favorite content.",
-        reply_markup=get_start_keyboard()
-    )
-
-# --- CALLBACK HANDLER (Buttons) ---
-@app.on_callback_query()
-async def callback_handler(client, cb: CallbackQuery):
-    try:
-        data = cb.data
-
-        if data == "home":
-            await cb.message.edit_text(
-                f"🎬 **Movie Club**\n\n"
-                f"Hey {cb.from_user.first_name}! \n"
-                f"Click the button below to open the library and watch your favorite content.",
-                reply_markup=get_start_keyboard()
-            )
-
-        elif data == "help":
-            text = (
-                "**📖 How to use:**\n\n"
-                "1. Click **📱 Open Movie App**.\n"
-                "2. Type a movie name in the search bar.\n"
-                "3. Click on the poster to see details.\n"
-                "4. Scroll down and click on a file (720p, 1080p, etc).\n"
-                "5. The bot will send the file here instantly!\n\n"
-                "⚠️ Files auto-delete in **2 minutes** to protect copyright."
-            )
-            await cb.message.edit_text(text, reply_markup=get_back_keyboard())
-
-        elif data == "stats":
-            await cb.answer("🔄 Fetching stats...")
-            
-            # Fetch Counts from Firebase
-            try:
-                # Note: getting full snapshots might be slow if DB is huge. 
-                # For small/medium bots, this is fine.
-                users_snapshot = db.reference('users').get()
-                files_snapshot = db.reference('files').get()
-                
-                total_users = len(users_snapshot) if users_snapshot else 0
-                total_files = len(files_snapshot) if files_snapshot else 0
-            except Exception as e:
-                total_users = "N/A"
-                total_files = "N/A"
-                logger.error(f"Stats error: {e}")
-
-            text = (
-                "**📊 Bot Statistics**\n\n"
-                f"👥 **Total Users:** {total_users}\n"
-                f"🎬 **Total Movies:** {total_files}"
-            )
-            await cb.message.edit_text(text, reply_markup=get_back_keyboard())
-
-    except Exception as e:
-        logger.error(f"Callback Error: {e}")
-
-# --- WEB APP DATA HANDLER ---
-@app.on_message(web_filter)
-async def web_app_data_handler(client, message):
-    try:
-        unique_id = message.web_app_data.data
-        
-        # 1. Get file from DB
-        ref = db.reference(f'files/{unique_id}')
-        file_data = ref.get()
-        
-        if not file_data:
-            await message.reply("❌ File not found in database.", quote=True)
-            return
-            
-        # 2. Notify user
-        status_msg = await message.reply(f"⬇️ **Sending:** `{file_data['file_name']}`...", quote=True)
-        
-        # 3. Send the file
-        caption = f"🎬 **{file_data['file_name']}**\n\n⚠️ **Auto-delete in 2 mins.**"
-        sent_file = await client.send_cached_media(
-            chat_id=message.chat.id,
-            file_id=file_data['file_id'],
-            caption=caption
-        )
-        
-        # 4. Clean up
-        await status_msg.delete()
-        asyncio.create_task(delete_later(sent_file, 120))
-        
-        # 5. Send Start menu again
-        await asyncio.sleep(1)
-        await message.reply_text(
-            "👇 **Search for more movies:**",
-            reply_markup=get_start_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Web App Error: {e}")
-
-async def delete_later(message, delay):
-    await asyncio.sleep(delay)
-    try:
-        await message.delete()
-    except:
+# --- SIMPLE HTTP SERVER FOR KOYEB HEALTH CHECKS ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ['/', '/health', '/ping']:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress the default logging
         pass
 
+def run_http_server():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f"🌐 HTTP Health Check Server started on port {port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+# --- SETUP BOT ---
+app = Client("MnSearchBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- GLOBAL STORAGE ---
+USER_SEARCHES = {}
+RESULTS_PER_PAGE = 10
+# Store scheduled delete tasks
+DELETE_TASKS = {}
+
+# --- HELPER: Size ---
+def get_size(size):
+    if not size: return "0B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    return f"{size:.2f} {units[i]}"
+
+# --- AUTO DELETE FUNCTION ---
+async def delete_file_after_delay(message_id, chat_id, delay_minutes=2):
+    """Delete a message after specified delay"""
+    try:
+        logger.info(f"⏰ Scheduled deletion for message {message_id} in {delay_minutes} minutes")
+        await asyncio.sleep(delay_minutes * 60)  # Convert minutes to seconds
+        
+        # Try to delete the message
+        try:
+            await app.delete_messages(chat_id, message_id)
+            logger.info(f"🗑️ Deleted message {message_id}")
+        except MessageDeleteForbidden:
+            logger.warning(f"⚠️ Cannot delete message {message_id} - forbidden")
+        except Exception as e:
+            logger.error(f"❌ Error deleting message {message_id}: {e}")
+        
+        # Remove task from tracking
+        if message_id in DELETE_TASKS:
+            del DELETE_TASKS[message_id]
+            
+    except asyncio.CancelledError:
+        logger.info(f"⏹️ Deletion cancelled for message {message_id}")
+    except Exception as e:
+        logger.error(f"❌ Error in delete_file_after_delay: {e}")
+
+# -----------------------------------------------------------------------------
+# 1. SMARTER FILE INDEXING (Fixes the "Row/Album" Issue)
+# -----------------------------------------------------------------------------
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
     try:
         media = message.document or message.video
         if not media: return
-        
-        filename = getattr(media, "file_name", None)
-        if not filename:
-             filename = message.caption.split("\n")[0].strip() if message.caption else f"Video_{message.id}.mp4"
 
-        data = {
+        # --- LOGIC TO FIX MISSING FILENAMES IN ALBUMS ---
+        filename = getattr(media, "file_name", None)
+        
+        # 1. If filename is missing, try to use the caption
+        if not filename:
+            if message.caption:
+                # Use first line of caption as filename
+                filename = message.caption.split("\n")[0].strip()
+                # Append extension if missing
+                if message.video and not "." in filename:
+                    filename += ".mp4"
+                elif message.document and not "." in filename:
+                    filename += ".mkv"
+            else:
+                # 2. If no caption, generate a name (so it still saves)
+                filename = f"Video_{message.id}.mp4"
+
+        # Replace dots with spaces for better search (optional)
+        # filename = filename.replace(".", " ")
+
+        # Validate Extension (Relaxed for Videos)
+        valid_exts = ('.mkv', '.mp4', '.avi', '.webm', '.mov')
+        if not filename.lower().endswith(valid_exts) and not message.video:
+            # If it's a document but not a video file, ignore it
+            return
+
+        # Prepare Data
+        file_data = {
             "file_name": filename,
             "file_size": media.file_size,
             "file_id": media.file_id,
-            "unique_id": media.file_unique_id
+            "unique_id": media.file_unique_id,
+            "caption": message.caption or filename # Use filename as caption if caption is empty
         }
-        db.reference(f'files/{media.file_unique_id}').set(data)
-        logger.info(f"Indexed: {filename}")
+
+        # Save to Firebase
+        # We use unique_id to prevent duplicates (Same file = Same ID)
+        ref = db.reference(f'files/{media.file_unique_id}')
+        ref.set(file_data)
+        
+        logger.info(f"✅ Indexed: {filename} (ID: {message.id})")
+
     except Exception as e:
-        logger.error(e)
+        logger.error(f"❌ Error indexing file: {e}")
+
+# -----------------------------------------------------------------------------
+# 2. COMMANDS & SEARCH
+# -----------------------------------------------------------------------------
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
+    await message.reply_text(
+        f"👋 **Hey {message.from_user.first_name}!**\n"
+        "Send me a movie name and I'll search for it.\n\n"
+        "⚠️ **Note:** All downloaded files will be automatically deleted after 2 minutes."
+    )
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_command(client, message):
+    await message.reply_text(
+        "**📖 Help Guide:**\n\n"
+        "• Just send me a movie name to search\n"
+        "• Click on files to download them\n"
+        "• Use pagination buttons to navigate\n\n"
+        "⏰ **Auto-delete feature:**\n"
+        "All downloaded files will be automatically deleted after 2 minutes to save space.\n\n"
+        "Made with ❤️ by Movie Search Bot"
+    )
+
+@app.on_message(filters.text & filters.private)
+async def search_handler(client, message):
+    query = message.text.strip().lower()
+    msg = await message.reply_text("⏳ **Searching...**")
+
+    try:
+        ref = db.reference('files')
+        snapshot = ref.get()
+
+        if not snapshot:
+            await msg.edit("❌ Database is empty.")
+            return
+
+        results = []
+        for key, val in snapshot.items():
+            # Search Logic: Check if query exists in filename
+            f_name = val.get('file_name', '').lower().replace(".", " ")
+            if query in f_name:
+                results.append(val)
+        
+        if not results:
+            await msg.edit(f"❌ No results found for: `{query}`")
+            return
+
+        USER_SEARCHES[message.from_user.id] = results
+        await send_results_page(message, msg, page=1)
+
+    except Exception as e:
+        logger.error(f"Search Error: {e}")
+        await msg.edit("❌ Error occurred.")
+
+# -----------------------------------------------------------------------------
+# 3. PAGINATION
+# -----------------------------------------------------------------------------
+async def send_results_page(message, editable_msg, page=1):
+    user_id = message.from_user.id
+    results = USER_SEARCHES.get(user_id)
+
+    if not results:
+        await editable_msg.edit("⚠️ Session expired.")
+        return
+
+    total_results = len(results)
+    total_pages = math.ceil(total_results / RESULTS_PER_PAGE)
+    start_i = (page - 1) * RESULTS_PER_PAGE
+    current_files = results[start_i : start_i + RESULTS_PER_PAGE]
+
+    buttons = []
+    for file in current_files:
+        size = get_size(file.get('file_size', 0))
+        name = file.get('file_name', 'Unknown')
+        # Cleanup name for button
+        btn_name = name.replace("[", "").replace("]", "")
+        if len(btn_name) > 40: btn_name = btn_name[:40] + "..."
+        
+        buttons.append([InlineKeyboardButton(f"[{size}] {btn_name}", callback_data=f"dl|{file['unique_id']}")])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
+    if nav: buttons.append(nav)
+
+    await editable_msg.edit_text(
+        f"🎬 **Found {total_results} Files**\n👇 Click to download:\n\n"
+        f"⚠️ **Note:** Files auto-delete in 2 minutes",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# -----------------------------------------------------------------------------
+# 4. CALLBACKS - SEND FILE WITH AUTO DELETE
+# -----------------------------------------------------------------------------
+@app.on_callback_query()
+async def callback_handler(client, cb):
+    try:
+        data = cb.data.split("|")
+        action = data[0]
+
+        if action == "dl":
+            unique_id = data[1]
+            ref = db.reference(f'files/{unique_id}')
+            file_data = ref.get()
+
+            if not file_data:
+                await cb.answer("❌ File not found.", show_alert=True)
+                return
+            
+            await cb.answer("📂 Sending...")
+            
+            # Send file with caption showing auto-delete warning
+            caption = f"{file_data.get('caption', '')}\n\n" \
+                     f"⏰ **This file will be automatically deleted in 2 minutes**"
+            
+            sent_message = await client.send_cached_media(
+                chat_id=cb.message.chat.id,
+                file_id=file_data['file_id'],
+                caption=caption
+            )
+            
+            # Schedule deletion after 2 minutes
+            if sent_message:
+                delete_task = asyncio.create_task(
+                    delete_file_after_delay(sent_message.id, cb.message.chat.id, 2)
+                )
+                DELETE_TASKS[sent_message.id] = delete_task
+                
+                # Send a reminder message
+                reminder = await cb.message.reply_text(
+                    f"⏰ **Reminder:** File will be deleted in 2 minutes.\n"
+                    f"File: {file_data.get('file_name', 'Unknown')}",
+                    quote=False
+                )
+                
+                # Also schedule deletion of the reminder message
+                reminder_task = asyncio.create_task(
+                    delete_file_after_delay(reminder.id, cb.message.chat.id, 2)
+                )
+                DELETE_TASKS[reminder.id] = reminder_task
+
+        elif action == "page":
+            await send_results_page(cb, cb.message, page=int(data[1]))
+        elif action == "noop":
+            await cb.answer("Current Page")
+
+    except Exception as e:
+        logger.error(f"Callback Error: {e}")
+
+# -----------------------------------------------------------------------------
+# 5. CANCEL ALL PENDING DELETE TASKS ON STOP
+# -----------------------------------------------------------------------------
+async def cancel_all_delete_tasks():
+    """Cancel all pending delete tasks when bot stops"""
+    logger.info("Cancelling all pending delete tasks...")
+    for message_id, task in list(DELETE_TASKS.items()):
+        try:
+            task.cancel()
+            await task
+        except:
+            pass
+    DELETE_TASKS.clear()
+
+# -----------------------------------------------------------------------------
+# 6. BOT STARTUP AND SHUTDOWN HANDLERS
+# -----------------------------------------------------------------------------
+@app.on_raw_update()
+async def handle_raw_update(client, update, users, chats):
+    # This handles bot startup/shutdown
+    pass
+
+def main():
+    # Start HTTP server in a separate thread for Koyeb health checks
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
+    
+    # Start the Telegram bot
+    print("Bot Started...")
+    
+    # Setup signal handlers for clean shutdown
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    finally:
+        # Cancel all pending tasks on exit
+        asyncio.run(cancel_all_delete_tasks())
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_flask_server, daemon=True)
-    t.start()
-    app.run()
+    main()
