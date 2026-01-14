@@ -4,6 +4,7 @@ import math
 import logging
 import asyncio
 import threading
+import time
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
@@ -14,11 +15,11 @@ from firebase_admin import credentials, db
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", ""))
-BOT_TOKEN = os.environ.get("BOT_TOKEN", ""))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
-DB_URL = os.environ.get("DB_URL", ""))
-FIREBASE_KEY = os.environ.get("FIREBASE_KEY", ""))
+DB_URL = os.environ.get("DB_URL", "")
+FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
 # Add these new configurations
 ADMIN_IDS = list(map(int, os.environ.get("ADMIN_IDS", "").split(','))) if os.environ.get("ADMIN_IDS") else []
@@ -529,7 +530,7 @@ async def send_results_page(message, editable_msg, page=1, is_group=False):
         ])
 
     await editable_msg.edit_text(
-        f"🎬 **Found {total_results} Files for:** `{query if hasattr(message, 'text') else 'Search'}`\n"
+        f"🎬 **Found {total_results} Files for:** `{query}`\n"
         f"👇 Click to download (will be sent to your PM):\n\n"
         f"⚠️ **Note:** Files auto-delete in 2 minutes",
         reply_markup=InlineKeyboardMarkup(buttons)
@@ -738,9 +739,6 @@ async def cancel_all_delete_tasks():
         except:
             pass
     DELETE_TASKS.clear()
-
-# Import time for cooldown
-import time
 
 def main():
     # Start HTTP server in a separate thread
