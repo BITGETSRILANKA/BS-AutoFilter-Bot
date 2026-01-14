@@ -5,6 +5,7 @@ import logging
 import asyncio
 import threading
 import re
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
@@ -12,6 +13,7 @@ from pyrogram.types import (
     InlineKeyboardButton, 
     InlineQueryResultCachedDocument
 )
+from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -20,6 +22,8 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
+# NEW: Your User ID for Admin commands
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0)) 
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 
@@ -81,6 +85,20 @@ def get_size(size):
         i += 1
     return f"{size:.2f} {units[i]}"
 
+# --- HELPER: Add User to Database ---
+def add_user(user_id):
+    try:
+        # Don't save channel IDs or negative IDs
+        if user_id < 0: return
+        
+        ref = db.reference(f'users/{user_id}')
+        # Only set if doesn't exist to save write ops
+        if not ref.get():
+            ref.set({"active": True})
+            logger.info(f"🆕 New User Added: {user_id}")
+    except Exception as e:
+        logger.error(f"DB Error: {e}")
+
 # --- AUTO DELETE FUNCTION ---
 async def delete_file_after_delay(message_id, chat_id, delay_minutes=2):
     try:
@@ -117,11 +135,9 @@ async def send_file_to_user(client, chat_id, unique_id):
         )
 
         if sent_msg:
-            # Schedule File Deletion (2 Minutes)
             task = asyncio.create_task(delete_file_after_delay(sent_msg.id, chat_id, 2))
             DELETE_TASKS[sent_msg.id] = task
             
-            # Send Reminder & Schedule its deletion too
             rem_msg = await client.send_message(
                 chat_id,
                 f"⏰ **File:** {filename}\nDeleting in 2 mins."
@@ -170,6 +186,9 @@ async def index_files(client, message):
 # -----------------------------------------------------------------------------
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
+    # Save User
+    add_user(message.from_user.id)
+
     if len(message.command) > 1:
         data = message.command[1]
         if data.startswith("dl_"):
@@ -193,11 +212,70 @@ async def start(client, message):
     )
 
 # -----------------------------------------------------------------------------
-# 3. TEXT SEARCH HANDLER (AUTO DELETE USER MSG)
+# 3. BROADCAST COMMAND (ADMIN ONLY)
+# -----------------------------------------------------------------------------
+@app.on_message(filters.command("broadcast") & filters.private & filters.reply & filters.user(ADMIN_ID))
+async def broadcast_handler(client, message):
+    msg = await message.reply_text("⏳ **Starting Broadcast...**")
+    
+    try:
+        # Get users from Firebase
+        ref = db.reference('users')
+        users_snapshot = ref.get()
+        
+        if not users_snapshot:
+            await msg.edit("❌ No users found in database.")
+            return
+
+        total_users = len(users_snapshot)
+        success = 0
+        blocked = 0
+        deleted = 0
+        failed = 0
+        
+        await msg.edit(f"📣 Broadcasting to {total_users} users...")
+        
+        broadcast_msg = message.reply_to_message
+        
+        for user_id in users_snapshot.keys():
+            try:
+                # Slight delay to prevent flood
+                await asyncio.sleep(0.2)
+                await broadcast_msg.copy(chat_id=int(user_id))
+                success += 1
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                await broadcast_msg.copy(chat_id=int(user_id))
+                success += 1
+            except (InputUserDeactivated, UserIsBlocked, PeerIdInvalid):
+                # Remove blocked users to clean DB
+                db.reference(f'users/{user_id}').delete()
+                blocked += 1
+                deleted += 1
+            except Exception as e:
+                failed += 1
+        
+        await msg.edit(
+            f"✅ **Broadcast Completed**\n\n"
+            f"📊 Total: {total_users}\n"
+            f"✅ Success: {success}\n"
+            f"🚫 Blocked/Deleted: {blocked}\n"
+            f"❌ Failed: {failed}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Broadcast Error: {e}")
+        await msg.edit(f"❌ Error: {e}")
+
+# -----------------------------------------------------------------------------
+# 4. TEXT SEARCH HANDLER
 # -----------------------------------------------------------------------------
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
     if message.text.startswith("/") or message.via_bot: return
+
+    # Save User
+    add_user(message.from_user.id)
 
     query = message.text.strip()
     is_group = message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]
@@ -207,14 +285,12 @@ async def search_handler(client, message):
 
     msg = await message.reply_text("⏳ **Searching...**", quote=True)
 
-    # --- AUTO DELETE LOGIC ---
-    # 1. Delete Bot's Reply after 10 mins
+    # --- AUTO DELETE ---
+    # 1. Delete Bot Reply (10 mins)
     asyncio.create_task(delete_file_after_delay(msg.id, message.chat.id, 10))
-    
-    # 2. Delete User's Request Message after 10 mins (Only in Groups)
+    # 2. Delete User Request (10 mins) - Group Only
     if is_group:
         asyncio.create_task(delete_file_after_delay(message.id, message.chat.id, 10))
-    # -------------------------
 
     try:
         ref = db.reference('files')
@@ -247,12 +323,15 @@ async def search_handler(client, message):
         await msg.edit("❌ Error occurred.")
 
 # -----------------------------------------------------------------------------
-# 4. INLINE SEARCH HANDLER
+# 5. INLINE SEARCH HANDLER
 # -----------------------------------------------------------------------------
 @app.on_inline_query()
 async def inline_search(client, query):
     text = query.query.strip().lower()
     
+    # Save User
+    add_user(query.from_user.id)
+
     if not text:
         return
 
@@ -299,7 +378,7 @@ async def inline_search(client, query):
         logger.error(f"Inline Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 5. PAGINATION & RESULTS DISPLAY
+# 6. PAGINATION & RESULTS DISPLAY
 # -----------------------------------------------------------------------------
 async def send_results_page(message, editable_msg, page=1, user_id=None):
     results = USER_SEARCHES.get(user_id)
@@ -356,7 +435,7 @@ async def send_results_page(message, editable_msg, page=1, user_id=None):
     await editable_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 # -----------------------------------------------------------------------------
-# 6. CALLBACK HANDLER
+# 7. CALLBACK HANDLER
 # -----------------------------------------------------------------------------
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -392,7 +471,7 @@ async def callback_handler(client, cb):
         logger.error(f"Callback Error: {e}")
 
 # -----------------------------------------------------------------------------
-# 7. MAIN
+# 8. MAIN
 # -----------------------------------------------------------------------------
 async def cancel_all_delete_tasks():
     for task in DELETE_TASKS.values():
