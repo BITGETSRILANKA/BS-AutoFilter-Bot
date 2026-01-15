@@ -1,6 +1,6 @@
 # 🎬 BS AutoFilter Bot (Advanced)
 
-A high-performance Telegram AutoFilter bot built with **Python (Pyrogram)** and **Firebase**. It features In-Memory caching for speed, persistent auto-deletion, and a force subscribe system.
+A high-performance Telegram AutoFilter bot built with **Python (Pyrogram)** and **Firebase**. It features In-Memory caching for speed, persistent auto-deletion, and smart group cleaning tools.
 
 [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/BITGETSRILANKA/BS-AutoFilter-Bot&branch=main&run_command=python+main.py)
 
@@ -9,11 +9,13 @@ A high-performance Telegram AutoFilter bot built with **Python (Pyrogram)** and 
 ## ✨ Key Features
 
 *   **⚡ Zero-Latency Search:** Uses RAM caching to search thousands of files instantly.
-*   **📢 Force Subscribe:** Users must join your update channel to use the bot.
+*   **📢 Broadcast System:** Admins can send messages to all bot users using a simple command.
+*   **🧹 Smart Auto-Cleaning:**
+    *   **User Queries:** Search messages ("the last of us") are auto-deleted after **10 minutes** to keep groups clean.
+    *   **Not Found Alerts:** "No movie found" warnings auto-delete after **20 seconds** to prevent spam.
+    *   **File Links:** Download links sent to users auto-delete after **2 minutes**.
 *   **🔒 Content Protection:** Files cannot be forwarded or saved (Restricted Content).
-*   **⏲️ Persistent Auto-Delete:**
-    *   Files sent to users are auto-deleted after **2 minutes**.
-    *   Tasks are saved to the database, so deletion works **even if the bot restarts**.
+*   **💾 Persistent Tasks:** Deletion tasks are saved to the database, ensuring files are deleted **even if the bot restarts**.
 *   **📊 Admin Stats:** View live RAM usage, total users, and file counts via `/stats`.
 *   **🔗 Deep Linking:** Smart links for groups and private chats.
 *   **❤️ Health Check:** Built-in HTTP server to prevent sleeping on cloud platforms.
@@ -41,9 +43,7 @@ Set these in your VPS `config.py` or Cloud Dashboard (Koyeb/Heroku/Render).
 | `API_HASH` | Telegram API Hash | `abc1234...` |
 | `BOT_TOKEN` | Bot Token from BotFather | `1234:AbCdEf...` |
 | `CHANNEL_ID` | Channel to index files from | `-100123456789` |
-| `ADMIN_ID` | **(NEW)** Your Telegram User ID for stats | `987654321` |
-| `FSUB_CHANNEL_ID` | **(NEW)** Channel ID users must join | `-100987654321` |
-| `FSUB_LINK` | **(NEW)** Invite link for that channel | `https://t.me/MyUpdates` |
+| `ADMIN_ID` | **(Required)** Your Telegram User ID | `987654321` |
 | `DB_URL` | Firebase Database URL | `https://project.firebaseio.com` |
 | `FIREBASE_KEY` | **Content** of serviceAccountKey.json | `{"type": "service...}` |
 | `PORT` | (Optional) HTTP Port | `8080` |
@@ -82,14 +82,15 @@ Set these in your VPS `config.py` or Cloud Dashboard (Koyeb/Heroku/Render).
 1.  **Inline Mode:** Go to **@BotFather** -> Bot Settings -> Inline Mode -> **Turn On**.
 2.  **Admin Rights:**
     *   Add the bot to your **Indexing Channel** (`CHANNEL_ID`) as Admin.
-    *   Add the bot to your **Force Sub Channel** (`FSUB_CHANNEL_ID`) as Admin.
+    *   Make sure the bot is Admin in groups to delete messages.
 
 ---
 
 ## 📝 Commands
 
-*   `/start` - Start the bot / Check subscription.
-*   `/stats` - **(Admin Only)** Check RAM usage and database count.
+*   `/start` - Start the bot.
+*   `/stats` - **(Admin Only)** Check RAM usage, total files, and users.
+*   `/broadcast` - **(Admin Only)** Reply to any message to send it to all users.
 *   **Search:** Type movie name in Group or PM.
 *   **Inline:** Type `@YourBotName query` in any chat.
 
