@@ -107,7 +107,7 @@ async def delete_file_after_delay(message_id, chat_id, delay_minutes=2):
         if message_id in DELETE_TASKS: del DELETE_TASKS[message_id]
     except: pass
 
-# --- FILE SENDING LOGIC (DUMP CHANNEL + INVITE LINK) ---
+# --- FILE SENDING LOGIC (UPDATED LINK GENERATION) ---
 async def send_file_to_user(client, chat_id, unique_id):
     try:
         ref = db.reference(f'files/{unique_id}')
@@ -135,7 +135,7 @@ async def send_file_to_user(client, chat_id, unique_id):
             )
         except Exception as e:
             logger.error(f"Dump Channel Error: {e}")
-            await client.send_message(chat_id, "❌ Error: Bot needs Admin (Invite Users) in Dump Channel.")
+            await client.send_message(chat_id, f"❌ Error sending to Dump Channel: {e}")
             return
 
         # 3. Schedule Deletion from Dump Channel
@@ -143,13 +143,17 @@ async def send_file_to_user(client, chat_id, unique_id):
         DELETE_TASKS[dump_msg.id] = task_dump
 
         # 4. Generate Links
-        # A. Invite Link (To Join)
+        # A. Invite Link (To Join) - CHANGED TO CREATE_CHAT_INVITE_LINK
         try:
-            # Tries to get the primary invite link
-            invite_link = await client.export_chat_invite_link(DUMP_CHANNEL_ID)
+            # We create a new link (or get existing non-primary) to avoid rights issues
+            # We check if we already have a link saved, or just generate one.
+            # To keep it simple and reliable: Create a link.
+            link_obj = await client.create_chat_invite_link(DUMP_CHANNEL_ID, name="BSFilterBot Access")
+            invite_link = link_obj.invite_link
         except Exception as e:
             logger.error(f"Link Gen Error: {e}")
-            await client.send_message(chat_id, "❌ Bot cannot generate Invite Link. Make sure it's Admin.")
+            # Fallback: Print the exact error to user so they can debug
+            await client.send_message(chat_id, f"❌ Link Gen Error: {e}\nCheck Bot Permissions!")
             return
 
         # B. Message Link (To View File)
