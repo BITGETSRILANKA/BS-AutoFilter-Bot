@@ -63,8 +63,8 @@ Set these in your VPS `config.py` or Cloud Dashboard (Koyeb/Heroku/Render).
 ### Option 2: VPS / Local
 1.  Clone the repo:
     ```bash
-    git clone https://github.com/YourUser/YourRepo.git
-    cd YourRepo
+    git clone https://github.com/BITGETSRILANKA/BS-AutoFilter-Bot.git
+    cd BS-AutoFilter-Bot
     ```
 2.  Install requirements:
     ```bash
