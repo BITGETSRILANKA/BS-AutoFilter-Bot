@@ -26,7 +26,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
-FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") # Paste JSON content here
+FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") 
 PORT = int(os.environ.get('PORT', 8080))
 DELETE_DELAY = 120  # 2 Minutes
 
@@ -54,6 +54,7 @@ if not firebase_admin._apps:
 FILES_CACHE = []
 USER_SEARCH_CACHE = {}
 BOT_USERNAME = ""
+RESULTS_PER_PAGE = 10
 
 # -----------------------------------------------------------------------------
 # 4. DATABASE & HELPER FUNCTIONS
@@ -74,7 +75,7 @@ def add_file_to_db(file_data):
     try:
         ref = db.reference(f'files/{file_data["unique_id"]}')
         ref.set(file_data)
-        FILES_CACHE.append(file_data) # Add to RAM immediately
+        FILES_CACHE.append(file_data) 
         return True
     except Exception as e:
         logger.error(f"DB Write Error: {e}")
@@ -148,6 +149,11 @@ def get_system_stats():
     process = psutil.Process(os.getpid())
     return get_size(process.memory_info().rss)
 
+async def temp_del(msg, seconds):
+    await asyncio.sleep(seconds)
+    try: await msg.delete()
+    except: pass
+
 # -----------------------------------------------------------------------------
 # 5. BOT CLIENT & HTTP SERVER
 # -----------------------------------------------------------------------------
@@ -163,11 +169,6 @@ def run_http_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
     server.serve_forever()
 
-async def temp_del(msg, seconds):
-    await asyncio.sleep(seconds)
-    try: await msg.delete()
-    except: pass
-
 # -----------------------------------------------------------------------------
 # 6. BACKGROUND TASKS
 # -----------------------------------------------------------------------------
@@ -181,10 +182,8 @@ async def check_auto_delete():
                     await app.delete_messages(task['chat_id'], task['message_id'])
                     logger.info(f"🗑️ Auto-deleted {task['message_id']}")
                 except Exception: pass
-                # Clean DB even if delete fails (msg likely already gone)
                 remove_delete_task(task['key'])
-        except Exception as e:
-            logger.error(f"Auto-Delete Error: {e}")
+        except Exception: pass
         await asyncio.sleep(20)
 
 # -----------------------------------------------------------------------------
@@ -226,7 +225,7 @@ async def index_handler(client, message):
     if not media: return
     
     filename = getattr(media, "file_name", None) or "Unknown"
-    # Fallback to caption if filename is weird
+    # Fallback to caption
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         filename = message.caption.splitlines()[0]
     
@@ -248,7 +247,9 @@ async def search_handler(client, message):
     query = message.text.strip()
     if len(query) < 2: return
 
-    # --- RAM SEARCH LOGIC ---
+    logger.info(f"🔎 Search: {query} by {message.from_user.id}")
+
+    # --- SEARCH LOGIC (Clean + Raw) ---
     raw_query = query.lower().split()
     clean_query = clean_text(query)
     results = []
@@ -260,21 +261,26 @@ async def search_handler(client, message):
         capt_raw = file.get('caption', '').lower()
         capt_clean = clean_text(capt_raw)
         
-        # Match against Filename OR Caption
+        # 1. Clean Match (Ignores dots/symbols)
         if clean_query in fname_clean or clean_query in capt_clean:
             results.append(file)
             continue
+        
+        # 2. Raw Match (Word by Word)
         if all(w in fname_raw for w in raw_query):
             results.append(file)
             
     if not results:
+        # Only say "No results" in PM to avoid spamming groups
         if message.chat.type == enums.ChatType.PRIVATE:
             msg = await message.reply_text(f"❌ No files found for: `{query}`")
             asyncio.create_task(temp_del(msg, 5))
         return
         
     USER_SEARCH_CACHE[message.from_user.id] = results
-    await send_results_page(message, page=1)
+    
+    # Send result with Explicit User ID
+    await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=False)
 
 @app.on_inline_query()
 async def inline_handler(client, query):
@@ -300,7 +306,7 @@ async def inline_handler(client, query):
             count += 1
             size = get_size(file['file_size'])
             
-            # CLEAN CAPTION (No Ads)
+            # CLEAN CAPTION
             clean_caption = (
                 f"📁 **{file['file_name']}**\n"
                 f"📊 Size: {size}\n\n"
@@ -340,10 +346,11 @@ async def send_file_to_user(client, chat_id, unique_id):
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
-async def send_results_page(message, page=1):
-    user_id = message.from_user.id
+async def send_results_page(message, user_id, page=1, is_edit=False):
     results = USER_SEARCH_CACHE.get(user_id)
-    if not results: return
+    if not results: 
+        if is_edit: await message.edit_text("⚠️ Session expired. Search again.")
+        return
     
     total = len(results)
     total_pages = math.ceil(total / RESULTS_PER_PAGE)
@@ -369,19 +376,34 @@ async def send_results_page(message, page=1):
     
     text = f"🔍 **Found {total} files**\nPage {page}/{total_pages}"
     
-    if isinstance(message, str): 
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else: 
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    try:
+        if is_edit:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        logger.error(f"Display Error: {e}")
 
 @app.on_callback_query()
 async def callback_handler(client, cb):
     data = cb.data.split("|")
+    
+    # ACTION: DOWNLOAD
     if data[0] == "dl":
         await cb.answer()
         await send_file_to_user(client, cb.message.chat.id, data[1])
+    
+    # ACTION: PAGINATION
     elif data[0] == "page":
-        await send_results_page(cb.message, page=int(data[1]))
+        # Pass cb.from_user.id (the user who clicked), not the bot's ID
+        await send_results_page(
+            cb.message, 
+            user_id=cb.from_user.id, 
+            page=int(data[1]), 
+            is_edit=True
+        )
+    
+    # ACTION: NOOP
     elif data[0] == "noop":
         await cb.answer()
 
@@ -389,20 +411,15 @@ async def callback_handler(client, cb):
 # 8. MAIN EXECUTION
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Start HTTP Server for Health Check
     threading.Thread(target=run_http_server, daemon=True).start()
-    
-    # Refresh Cache from DB
     refresh_cache()
     
     print("🤖 Bot Starting...")
     app.start()
     
-    # Get Username
     me = app.get_me()
     BOT_USERNAME = me.username
     
-    # Start Auto-Delete Loop
     loop = asyncio.get_event_loop()
     loop.create_task(check_auto_delete())
     
