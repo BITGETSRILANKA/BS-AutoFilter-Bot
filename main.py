@@ -21,7 +21,12 @@ app = Client(
 )
 BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
-USER_SEARCH_CACHE = {} # Temp storage for pagination
+USER_SEARCH_CACHE = {} 
+
+# --- HELPER: SHOBANA STYLE CLEANER ---
+def clean_text(text):
+    """Removes all special characters, keeping only alphanumeric."""
+    return re.sub(r'[\W_]+', '', text).lower()
 
 # --- HTTP SERVER ---
 class HealthHandler(BaseHTTPRequestHandler):
@@ -36,7 +41,6 @@ def run_http_server():
 
 # --- BACKGROUND TASK: AUTO DELETE ---
 async def check_auto_delete():
-    """Runs forever. Checks DB for messages to delete."""
     while True:
         try:
             tasks = database.get_due_delete_tasks()
@@ -44,15 +48,11 @@ async def check_auto_delete():
                 try:
                     await app.delete_messages(task['chat_id'], task['message_id'])
                     config.logger.info(f"🗑️ Auto-deleted {task['message_id']}")
-                except Exception as e:
-                    config.logger.warning(f"Delete fail: {e}") 
-                
-                # Remove from DB regardless of success
+                except Exception:
+                    pass 
                 database.remove_delete_task(task['key'])
-                
         except Exception as e:
             config.logger.error(f"Auto-Delete Loop Error: {e}")
-        
         await asyncio.sleep(20) 
 
 # --- COMMAND: START ---
@@ -68,7 +68,7 @@ async def start(client, message):
             reply_markup=InlineKeyboardMarkup(btn)
         )
 
-    # 2. Handle Deep Linking
+    # 2. Handle Deep Linking (File Download)
     if len(message.command) > 1 and message.command[1].startswith("dl_"):
         unique_id = message.command[1].split("_")[1]
         await send_file_to_user(client, message.chat.id, unique_id)
@@ -85,18 +85,10 @@ async def start(client, message):
 @app.on_message(filters.command("stats") & filters.user(config.ADMIN_ID))
 async def stats_handler(client, message):
     msg = await message.reply_text("⏳ Calculating...")
-    
     files = len(database.FILES_CACHE)
     users = database.get_total_users()
     ram = utils.get_system_stats()
-    
-    text = (
-        f"📊 **System Statistics**\n\n"
-        f"📂 **Files Indexed:** `{files}`\n"
-        f"👤 **Total Users:** `{users}`\n"
-        f"💾 **RAM Usage:** `{ram}`"
-    )
-    await msg.edit(text)
+    await msg.edit(f"📊 **Stats**\n📂 Files: `{files}`\n👤 Users: `{users}`\n💾 RAM: `{ram}`")
 
 # --- INDEXING ---
 @app.on_message(filters.chat(config.CHANNEL_ID) & (filters.document | filters.video))
@@ -105,9 +97,8 @@ async def index_files(client, message):
     if not media: return
     
     filename = getattr(media, "file_name", None) or "Unknown"
-    
-    # If filename is generic, try to use caption first line
-    if (not filename or filename == "Unknown") and message.caption:
+    # Use caption if filename is generic
+    if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         filename = message.caption.splitlines()[0]
     
     data = {
@@ -115,7 +106,7 @@ async def index_files(client, message):
         "file_size": media.file_size,
         "file_id": media.file_id,
         "unique_id": media.file_unique_id,
-        "caption": message.caption or filename # We save original caption for search, but won't display it
+        "caption": message.caption or filename 
     }
     
     if database.add_file_to_db(data):
@@ -126,33 +117,48 @@ async def index_files(client, message):
 async def text_search(client, message):
     if message.text.startswith("/") or message.via_bot: return
     
-    # FSub Check 
+    # FSub Check (Only for Private)
     if message.chat.type == enums.ChatType.PRIVATE:
         if not await utils.get_fsub(client, message):
             btn = [[InlineKeyboardButton("Join Channel", url=config.FSUB_LINK)]]
             await message.reply_text("⚠️ Join channel first.", reply_markup=InlineKeyboardMarkup(btn))
             return
 
-    query = message.text.strip().lower()
+    query = message.text.strip()
     if len(query) < 2: return
 
-    # IMPROVED SEARCH LOGIC
-    query_words = re.sub(r'[._-]', ' ', query).split()
+    # --- SHOBANA STYLE SEARCH MECHANISM ---
+    # 1. Clean query (alphanumeric only)
+    raw_query = query.lower().split()
+    clean_query = clean_text(query)
+    
     results = []
     
     for file in database.FILES_CACHE:
-        # Prepare Searchable Text: Filename + Original Caption
-        fname = re.sub(r'[._-]', ' ', file.get('file_name', '')).lower()
-        fcaption = re.sub(r'[._-]', ' ', file.get('caption', '')).lower()
+        # Prepare file name
+        fname_raw = file.get('file_name', '').lower()
+        fname_clean = clean_text(fname_raw)
         
-        searchable_text = f"{fname} {fcaption}" # Search in both
+        # Prepare caption
+        capt_raw = file.get('caption', '').lower()
+        capt_clean = clean_text(capt_raw)
         
-        if all(w in searchable_text for w in query_words):
+        # LOGIC 1: Exact "Clean" Match (Robust)
+        # e.g. "Spider-Man" (file) matches "spiderman" (query)
+        if clean_query in fname_clean or clean_query in capt_clean:
+            results.append(file)
+            continue
+            
+        # LOGIC 2: Word-by-Word Match (Standard)
+        # e.g. "Iron Man 2008" matches "2008 Iron Man"
+        if all(w in fname_raw for w in raw_query):
             results.append(file)
             
     if not results:
-        msg = await message.reply_text(f"❌ No files found for: `{query}`")
-        asyncio.create_task(temp_del(msg, 10)) 
+        # Only reply in Private or if directly mentioned in Group
+        if message.chat.type == enums.ChatType.PRIVATE:
+            msg = await message.reply_text(f"❌ No files found for: `{query}`")
+            asyncio.create_task(temp_del(msg, 5))
         return
         
     USER_SEARCH_CACHE[message.from_user.id] = results
@@ -161,26 +167,30 @@ async def text_search(client, message):
 # --- INLINE SEARCH ---
 @app.on_inline_query()
 async def inline_search(client, query):
-    text = query.query.strip().lower()
+    text = query.query.strip()
     if not text: return
     
-    query_words = re.sub(r'[._-]', ' ', text).split()
+    clean_q = clean_text(text)
+    raw_q = text.lower().split()
     results = []
     count = 0
     
     for file in database.FILES_CACHE:
         if count >= 50: break
         
-        # Prepare Searchable Text: Filename + Original Caption
-        fname = re.sub(r'[._-]', ' ', file.get('file_name', '')).lower()
-        fcaption = re.sub(r'[._-]', ' ', file.get('caption', '')).lower()
-        searchable_text = f"{fname} {fcaption}"
-
-        if all(w in searchable_text for w in query_words):
+        fname_raw = file.get('file_name', '').lower()
+        fname_clean = clean_text(fname_raw)
+        
+        # Match Logic
+        matched = False
+        if clean_q in fname_clean: matched = True
+        elif all(w in fname_raw for w in raw_q): matched = True
+        
+        if matched:
             count += 1
             size = utils.get_size(file['file_size'])
             
-            # CLEAN CAPTION FOR RESULT (No more Ads/Promotions)
+            # Clean Caption (No Ads)
             clean_caption = (
                 f"📁 **{file['file_name']}**\n"
                 f"📊 Size: {size}\n\n"
@@ -193,7 +203,7 @@ async def inline_search(client, query):
                     title=file['file_name'],
                     document_file_id=file['file_id'],
                     description=f"Size: {size}",
-                    caption=clean_caption # Uses the clean caption now
+                    caption=clean_caption 
                 )
             )
     await query.answer(results, cache_time=10)
@@ -201,11 +211,9 @@ async def inline_search(client, query):
 # --- SENDING FILE LOGIC ---
 async def send_file_to_user(client, chat_id, unique_id):
     file_data = database.get_file_by_id(unique_id)
-    
     if not file_data:
         return await client.send_message(chat_id, "❌ File removed.")
     
-    # Generate Clean Caption
     caption = (
         f"📁 **{file_data['file_name']}**\n"
         f"📊 Size: {utils.get_size(file_data['file_size'])}\n\n"
@@ -218,11 +226,8 @@ async def send_file_to_user(client, chat_id, unique_id):
             file_id=file_data['file_id'],
             caption=caption
         )
-        
-        # Add to Persistent Delete Queue
         delete_time = time.time() + config.DELETE_DELAY
         database.add_delete_task(chat_id, sent.id, delete_time)
-        
     except Exception as e:
         config.logger.error(f"Send Error: {e}")
 
@@ -256,9 +261,9 @@ async def send_results_page(message, page=1):
     
     text = f"🔍 **Found {total} files**\nPage {page}/{total_pages}"
     
-    if isinstance(message, str): # Edited message
+    if isinstance(message, str): 
         await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else: # New message
+    else: 
         await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 @app.on_callback_query()
@@ -277,21 +282,14 @@ async def temp_del(msg, seconds):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    # Start HTTP Server
     threading.Thread(target=run_http_server, daemon=True).start()
-    
-    # Load Cache
     database.refresh_cache()
-    
     print("🤖 Bot Starting...")
     app.start()
     me = app.get_me()
     BOT_USERNAME = me.username
-    
-    # Start Auto-Delete Loop
     loop = asyncio.get_event_loop()
     loop.create_task(check_auto_delete())
-    
     print(f"✅ Bot Started as @{BOT_USERNAME}")
     from pyrogram import idle
     idle()
