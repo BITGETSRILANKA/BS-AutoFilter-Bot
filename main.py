@@ -34,7 +34,7 @@ def run_http_server():
     server = HTTPServer(('0.0.0.0', config.PORT), HealthHandler)
     server.serve_forever()
 
-# --- BACKGROUND TASK: AUTO DELETE (Improvement 5) ---
+# --- BACKGROUND TASK: AUTO DELETE ---
 async def check_auto_delete():
     """Runs forever. Checks DB for messages to delete."""
     while True:
@@ -45,7 +45,7 @@ async def check_auto_delete():
                     await app.delete_messages(task['chat_id'], task['message_id'])
                     config.logger.info(f"🗑️ Auto-deleted {task['message_id']}")
                 except Exception as e:
-                    config.logger.warning(f"Delete fail: {e}") # Msg likely already deleted
+                    config.logger.warning(f"Delete fail: {e}") 
                 
                 # Remove from DB regardless of success
                 database.remove_delete_task(task['key'])
@@ -53,7 +53,7 @@ async def check_auto_delete():
         except Exception as e:
             config.logger.error(f"Auto-Delete Loop Error: {e}")
         
-        await asyncio.sleep(20) # Check every 20 seconds
+        await asyncio.sleep(20) 
 
 # --- COMMAND: START ---
 @app.on_message(filters.command("start") & filters.private)
@@ -81,7 +81,7 @@ async def start(client, message):
     ]
     await message.reply_text(f"👋 Hi **{message.from_user.first_name}**! I am an advanced Filter Bot.", reply_markup=InlineKeyboardMarkup(buttons))
 
-# --- COMMAND: STATS (Improvement 4) ---
+# --- COMMAND: STATS ---
 @app.on_message(filters.command("stats") & filters.user(config.ADMIN_ID))
 async def stats_handler(client, message):
     msg = await message.reply_text("⏳ Calculating...")
@@ -105,7 +105,9 @@ async def index_files(client, message):
     if not media: return
     
     filename = getattr(media, "file_name", None) or "Unknown"
-    if not filename and message.caption:
+    
+    # If filename is generic, try to use caption first line
+    if (not filename or filename == "Unknown") and message.caption:
         filename = message.caption.splitlines()[0]
     
     data = {
@@ -113,18 +115,18 @@ async def index_files(client, message):
         "file_size": media.file_size,
         "file_id": media.file_id,
         "unique_id": media.file_unique_id,
-        "caption": message.caption or filename
+        "caption": message.caption or filename # We save original caption for search, but won't display it
     }
     
     if database.add_file_to_db(data):
         config.logger.info(f"✅ Indexed: {filename}")
 
-# --- SEARCH HANDLER ---
+# --- SEARCH HANDLER (TEXT) ---
 @app.on_message(filters.text & (filters.private | filters.group))
 async def text_search(client, message):
     if message.text.startswith("/") or message.via_bot: return
     
-    # FSub Check (Optional for groups, mandatory for PM)
+    # FSub Check 
     if message.chat.type == enums.ChatType.PRIVATE:
         if not await utils.get_fsub(client, message):
             btn = [[InlineKeyboardButton("Join Channel", url=config.FSUB_LINK)]]
@@ -134,18 +136,23 @@ async def text_search(client, message):
     query = message.text.strip().lower()
     if len(query) < 2: return
 
-    # SEARCH IN RAM (Improvement 1)
+    # IMPROVED SEARCH LOGIC
     query_words = re.sub(r'[._-]', ' ', query).split()
     results = []
     
     for file in database.FILES_CACHE:
-        fname = re.sub(r'[._-]', ' ', file.get('file_name', '').lower())
-        if all(w in fname for w in query_words):
+        # Prepare Searchable Text: Filename + Original Caption
+        fname = re.sub(r'[._-]', ' ', file.get('file_name', '')).lower()
+        fcaption = re.sub(r'[._-]', ' ', file.get('caption', '')).lower()
+        
+        searchable_text = f"{fname} {fcaption}" # Search in both
+        
+        if all(w in searchable_text for w in query_words):
             results.append(file)
             
     if not results:
         msg = await message.reply_text(f"❌ No files found for: `{query}`")
-        asyncio.create_task(temp_del(msg, 10)) # Helper to delete "No results" msg
+        asyncio.create_task(temp_del(msg, 10)) 
         return
         
     USER_SEARCH_CACHE[message.from_user.id] = results
@@ -163,18 +170,30 @@ async def inline_search(client, query):
     
     for file in database.FILES_CACHE:
         if count >= 50: break
-        fname = re.sub(r'[._-]', ' ', file.get('file_name', '').lower())
         
-        if all(w in fname for w in query_words):
+        # Prepare Searchable Text: Filename + Original Caption
+        fname = re.sub(r'[._-]', ' ', file.get('file_name', '')).lower()
+        fcaption = re.sub(r'[._-]', ' ', file.get('caption', '')).lower()
+        searchable_text = f"{fname} {fcaption}"
+
+        if all(w in searchable_text for w in query_words):
             count += 1
             size = utils.get_size(file['file_size'])
+            
+            # CLEAN CAPTION FOR RESULT (No more Ads/Promotions)
+            clean_caption = (
+                f"📁 **{file['file_name']}**\n"
+                f"📊 Size: {size}\n\n"
+                f"🤖 Bot: @{BOT_USERNAME}"
+            )
+
             results.append(
                 InlineQueryResultCachedDocument(
                     id=file['unique_id'],
                     title=file['file_name'],
                     document_file_id=file['file_id'],
                     description=f"Size: {size}",
-                    caption=file['caption']
+                    caption=clean_caption # Uses the clean caption now
                 )
             )
     await query.answer(results, cache_time=10)
@@ -186,6 +205,7 @@ async def send_file_to_user(client, chat_id, unique_id):
     if not file_data:
         return await client.send_message(chat_id, "❌ File removed.")
     
+    # Generate Clean Caption
     caption = (
         f"📁 **{file_data['file_name']}**\n"
         f"📊 Size: {utils.get_size(file_data['file_size'])}\n\n"
@@ -196,11 +216,10 @@ async def send_file_to_user(client, chat_id, unique_id):
         sent = await client.send_cached_media(
             chat_id=chat_id,
             file_id=file_data['file_id'],
-            caption=caption,
-            protect_content=True  # Security Improvement (No forwarding)
+            caption=caption
         )
         
-        # Add to Persistent Delete Queue (Improvement 5)
+        # Add to Persistent Delete Queue
         delete_time = time.time() + config.DELETE_DELAY
         database.add_delete_task(chat_id, sent.id, delete_time)
         
