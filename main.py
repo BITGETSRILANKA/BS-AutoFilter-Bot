@@ -23,9 +23,8 @@ BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 USER_SEARCH_CACHE = {} 
 
-# --- HELPER: SHOBANA STYLE CLEANER ---
+# --- HELPER: CLEAN TEXT ---
 def clean_text(text):
-    """Removes all special characters, keeping only alphanumeric."""
     return re.sub(r'[\W_]+', '', text).lower()
 
 # --- HTTP SERVER ---
@@ -48,56 +47,32 @@ async def check_auto_delete():
                 try:
                     await app.delete_messages(task['chat_id'], task['message_id'])
                     config.logger.info(f"🗑️ Auto-deleted {task['message_id']}")
-                except Exception:
-                    pass 
+                except Exception: pass 
                 database.remove_delete_task(task['key'])
-        except Exception as e:
-            config.logger.error(f"Auto-Delete Loop Error: {e}")
+        except Exception: pass
         await asyncio.sleep(20) 
 
 # --- COMMAND: START ---
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     database.add_user(message.from_user.id)
-    
-    # 1. Force Sub Check
-    if not await utils.get_fsub(client, message):
-        btn = [[InlineKeyboardButton("📢 Join Update Channel", url=config.FSUB_LINK)]]
-        return await message.reply_text(
-            "⚠️ **You must join our channel to use this bot!**\n\nJoin below and click /start again.",
-            reply_markup=InlineKeyboardMarkup(btn)
-        )
-
-    # 2. Handle Deep Linking (File Download)
     if len(message.command) > 1 and message.command[1].startswith("dl_"):
         unique_id = message.command[1].split("_")[1]
         await send_file_to_user(client, message.chat.id, unique_id)
         return
 
-    # 3. Normal Welcome
     buttons = [
         [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
         [InlineKeyboardButton("🔎 Inline Search", switch_inline_query_current_chat="")]
     ]
-    await message.reply_text(f"👋 Hi **{message.from_user.first_name}**! I am an advanced Filter Bot.", reply_markup=InlineKeyboardMarkup(buttons))
-
-# --- COMMAND: STATS ---
-@app.on_message(filters.command("stats") & filters.user(config.ADMIN_ID))
-async def stats_handler(client, message):
-    msg = await message.reply_text("⏳ Calculating...")
-    files = len(database.FILES_CACHE)
-    users = database.get_total_users()
-    ram = utils.get_system_stats()
-    await msg.edit(f"📊 **Stats**\n📂 Files: `{files}`\n👤 Users: `{users}`\n💾 RAM: `{ram}`")
+    await message.reply_text(f"👋 Hi **{message.from_user.first_name}**! I am an advanced Filter Bot.\n\nType a movie name to search.", reply_markup=InlineKeyboardMarkup(buttons))
 
 # --- INDEXING ---
 @app.on_message(filters.chat(config.CHANNEL_ID) & (filters.document | filters.video))
 async def index_files(client, message):
     media = message.document or message.video
     if not media: return
-    
     filename = getattr(media, "file_name", None) or "Unknown"
-    # Use caption if filename is generic
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         filename = message.caption.splitlines()[0]
     
@@ -108,107 +83,131 @@ async def index_files(client, message):
         "unique_id": media.file_unique_id,
         "caption": message.caption or filename 
     }
-    
     if database.add_file_to_db(data):
         config.logger.info(f"✅ Indexed: {filename}")
 
-# --- SEARCH HANDLER (TEXT) ---
+# --- SEARCH HANDLER (TEXT + TMDB) ---
 @app.on_message(filters.text & (filters.private | filters.group))
 async def text_search(client, message):
     if message.text.startswith("/") or message.via_bot: return
     
-    # FSub Check (Only for Private)
-    if message.chat.type == enums.ChatType.PRIVATE:
-        if not await utils.get_fsub(client, message):
-            btn = [[InlineKeyboardButton("Join Channel", url=config.FSUB_LINK)]]
-            await message.reply_text("⚠️ Join channel first.", reply_markup=InlineKeyboardMarkup(btn))
-            return
-
     query = message.text.strip()
     if len(query) < 2: return
 
-    # --- SHOBANA STYLE SEARCH MECHANISM ---
-    # 1. Clean query (alphanumeric only)
+    # 1. Search Files in RAM
     raw_query = query.lower().split()
     clean_query = clean_text(query)
-    
     results = []
     
     for file in database.FILES_CACHE:
-        # Prepare file name
         fname_raw = file.get('file_name', '').lower()
         fname_clean = clean_text(fname_raw)
-        
-        # Prepare caption
         capt_raw = file.get('caption', '').lower()
         capt_clean = clean_text(capt_raw)
         
-        # LOGIC 1: Exact "Clean" Match (Robust)
-        # e.g. "Spider-Man" (file) matches "spiderman" (query)
         if clean_query in fname_clean or clean_query in capt_clean:
             results.append(file)
             continue
-            
-        # LOGIC 2: Word-by-Word Match (Standard)
-        # e.g. "Iron Man 2008" matches "2008 Iron Man"
         if all(w in fname_raw for w in raw_query):
             results.append(file)
             
     if not results:
-        # Only reply in Private or if directly mentioned in Group
         if message.chat.type == enums.ChatType.PRIVATE:
             msg = await message.reply_text(f"❌ No files found for: `{query}`")
             asyncio.create_task(temp_del(msg, 5))
         return
-        
-    USER_SEARCH_CACHE[message.from_user.id] = results
-    await send_results_page(message, page=1)
 
-# --- INLINE SEARCH ---
-@app.on_inline_query()
-async def inline_search(client, query):
-    text = query.query.strip()
-    if not text: return
+    # 2. Get TMDB Data (Only if in Private Chat or User explicitly searched)
+    tmdb_data = None
+    if config.TMDB_API_KEY:
+        tmdb_data = utils.search_tmdb(query)
+
+    # 3. Cache Results
+    USER_SEARCH_CACHE[message.from_user.id] = {
+        "files": results,
+        "tmdb": tmdb_data,
+        "query": query
+    }
+
+    # 4. Send First Page
+    await send_results_page(message, page=1, is_new=True)
+
+# --- PAGINATION & SENDING ---
+async def send_results_page(message, page=1, is_new=False):
+    user_id = message.from_user.id
+    cached_data = USER_SEARCH_CACHE.get(user_id)
+    if not cached_data: return
     
-    clean_q = clean_text(text)
-    raw_q = text.lower().split()
-    results = []
-    count = 0
+    results = cached_data['files']
+    tmdb = cached_data['tmdb']
     
-    for file in database.FILES_CACHE:
-        if count >= 50: break
-        
-        fname_raw = file.get('file_name', '').lower()
-        fname_clean = clean_text(fname_raw)
-        
-        # Match Logic
-        matched = False
-        if clean_q in fname_clean: matched = True
-        elif all(w in fname_raw for w in raw_q): matched = True
-        
-        if matched:
-            count += 1
-            size = utils.get_size(file['file_size'])
-            
-            # Clean Caption (No Ads)
-            clean_caption = (
-                f"📁 **{file['file_name']}**\n"
-                f"📊 Size: {size}\n\n"
-                f"🤖 Bot: @{BOT_USERNAME}"
-            )
+    total = len(results)
+    total_pages = math.ceil(total / config.RESULTS_PER_PAGE)
+    start = (page - 1) * config.RESULTS_PER_PAGE
+    current = results[start : start + config.RESULTS_PER_PAGE]
+    
+    # Generate Buttons
+    buttons = []
+    for file in current:
+        name = file['file_name'][:30]
+        size = utils.get_size(file['file_size'])
+        if message.chat.type == enums.ChatType.PRIVATE:
+            cb_data = f"dl|{file['unique_id']}"
+            buttons.append([InlineKeyboardButton(f"[{size}] {name}", callback_data=cb_data)])
+        else:
+            url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
+            buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
 
-            results.append(
-                InlineQueryResultCachedDocument(
-                    id=file['unique_id'],
-                    title=file['file_name'],
-                    document_file_id=file['file_id'],
-                    description=f"Size: {size}",
-                    caption=clean_caption 
-                )
-            )
-    await query.answer(results, cache_time=10)
+    # Navigation Buttons
+    nav = []
+    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
+    if nav: buttons.append(nav)
+    
+    # Generate Caption
+    if tmdb:
+        caption = (
+            f"🎬 **{tmdb['title']}**\n"
+            f"⭐️ Rating: {tmdb['rating']}/10\n"
+            f"📖 {tmdb['overview']}\n\n"
+            f"📂 **Found {total} Files**"
+        )
+    else:
+        caption = f"🎬 **Found {total} files** for `{cached_data['query']}`\nPage {page}/{total_pages}"
+    
+    reply_markup = InlineKeyboardMarkup(buttons)
 
-# --- SENDING FILE LOGIC ---
+    # Sending Logic
+    if is_new:
+        # SEND NEW MESSAGE
+        if tmdb and tmdb['poster']:
+            await message.reply_photo(tmdb['poster'], caption=caption, reply_markup=reply_markup)
+        else:
+            await message.reply_text(caption, reply_markup=reply_markup)
+    else:
+        # EDIT EXISTING MESSAGE
+        try:
+            if message.photo:
+                await message.edit_caption(caption=caption, reply_markup=reply_markup)
+            else:
+                await message.edit_text(text=caption, reply_markup=reply_markup)
+        except Exception as e:
+            pass # Message might be too old or deleted
+
+# --- CALLBACKS ---
+@app.on_callback_query()
+async def callbacks(client, cb):
+    data = cb.data.split("|")
+    if data[0] == "dl":
+        await cb.answer()
+        await send_file_to_user(client, cb.message.chat.id, data[1])
+    elif data[0] == "page":
+        await send_results_page(cb.message, page=int(data[1]), is_new=False)
+    elif data[0] == "noop":
+        await cb.answer()
+
+# --- FILE SENDING ---
 async def send_file_to_user(client, chat_id, unique_id):
     file_data = database.get_file_by_id(unique_id)
     if not file_data:
@@ -231,49 +230,40 @@ async def send_file_to_user(client, chat_id, unique_id):
     except Exception as e:
         config.logger.error(f"Send Error: {e}")
 
-# --- PAGINATION ---
-async def send_results_page(message, page=1):
-    user_id = message.from_user.id
-    results = USER_SEARCH_CACHE.get(user_id)
-    if not results: return
+# --- INLINE SEARCH (Kept Simple without TMDB to be fast) ---
+@app.on_inline_query()
+async def inline_search(client, query):
+    text = query.query.strip()
+    if not text: return
     
-    total = len(results)
-    total_pages = math.ceil(total / config.RESULTS_PER_PAGE)
-    start = (page - 1) * config.RESULTS_PER_PAGE
-    current = results[start : start + config.RESULTS_PER_PAGE]
+    clean_q = clean_text(text)
+    raw_q = text.lower().split()
+    results = []
+    count = 0
     
-    buttons = []
-    for file in current:
-        name = file['file_name'][:30]
-        size = utils.get_size(file['file_size'])
-        if message.chat.type == enums.ChatType.PRIVATE:
-            cb_data = f"dl|{file['unique_id']}"
-            buttons.append([InlineKeyboardButton(f"[{size}] {name}", callback_data=cb_data)])
-        else:
-            url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
-            buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
-
-    nav = []
-    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
-    if nav: buttons.append(nav)
-    
-    text = f"🔍 **Found {total} files**\nPage {page}/{total_pages}"
-    
-    if isinstance(message, str): 
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else: 
-        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-@app.on_callback_query()
-async def callbacks(client, cb):
-    data = cb.data.split("|")
-    if data[0] == "dl":
-        await cb.answer()
-        await send_file_to_user(client, cb.message.chat.id, data[1])
-    elif data[0] == "page":
-        await send_results_page(cb.message, page=int(data[1]))
+    for file in database.FILES_CACHE:
+        if count >= 50: break
+        fname_raw = file.get('file_name', '').lower()
+        fname_clean = clean_text(fname_raw)
+        
+        matched = False
+        if clean_q in fname_clean: matched = True
+        elif all(w in fname_raw for w in raw_q): matched = True
+        
+        if matched:
+            count += 1
+            size = utils.get_size(file['file_size'])
+            clean_caption = f"📁 **{file['file_name']}**\n📊 Size: {size}\n\n🤖 Bot: @{BOT_USERNAME}"
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id=file['unique_id'],
+                    title=file['file_name'],
+                    document_file_id=file['file_id'],
+                    description=f"Size: {size}",
+                    caption=clean_caption 
+                )
+            )
+    await query.answer(results, cache_time=10)
 
 async def temp_del(msg, seconds):
     await asyncio.sleep(seconds)
