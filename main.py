@@ -15,7 +15,8 @@ from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, Peer
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    InlineQueryResultCachedDocument
+    InlineQueryResultCachedDocument,
+    CallbackQuery
 )
 
 # Firebase
@@ -43,9 +44,9 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120   # 2 Minutes
-USER_MSG_DELETE_TIME = 600   # 10 Minutes (Search Results)
-NOT_FOUND_DELETE_TIME = 300  # 5 Minutes (No Result Warning)
+FILE_MSG_DELETE_TIME = 120   # 2 Minutes (The file itself)
+USER_MSG_DELETE_TIME = 300   # 5 Minutes (User Query & Search Results)
+SUGGESTION_DELETE_TIME = 300 # 5 Minutes (The "Did you mean" message)
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -88,7 +89,6 @@ def refresh_cache():
         logger.error(f"Cache Refresh Error: {e}")
 
 def add_file_to_db(file_data):
-    # Check duplicates in RAM
     for f in FILES_CACHE:
         if f['unique_id'] == file_data['unique_id']:
             return False
@@ -169,8 +169,27 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 def clean_text(text):
-    # This replaces all non-alphanumeric chars (including _) with space
+    # Basic cleaning for search comparison
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
+
+def extract_proper_title(text):
+    """
+    Tries to extract the 'Movie Name' from a long filename.
+    Removes S01, E01, 720p, 2024, etc.
+    Input: Stranger_Things_S01E01_720p.mkv
+    Output: Stranger Things
+    """
+    # Replace dots and underscores with spaces
+    text = re.sub(r'[\._]', ' ', text)
+    
+    # Common regex patterns to cut off the title
+    # Stops at: S01, E01, 4 digit year (1999-2029), 720p/1080p, etc
+    pattern = r'(?i)\b(s\d{1,2}|e\d{1,2}|\d{4}|720p|1080p|480p|h264|x264|x265|bluray|web-dl|dvdrip)\b'
+    
+    split_text = re.split(pattern, text)
+    if split_text:
+        return split_text[0].strip().title() # Return the part before the junk
+    return text.strip().title()
 
 def get_system_stats():
     process = psutil.Process(os.getpid())
@@ -237,7 +256,6 @@ async def stats_handler(client, message):
     ram = get_system_stats()
     await msg.edit(f"📊 **Bot Stats**\n\n📂 Files: `{files}`\n👤 Users: `{users}`\n💾 RAM: `{ram}`")
 
-# --- DELETE COMMAND ---
 @app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
 async def delete_handler(client, message):
     unique_id = None
@@ -255,15 +273,13 @@ async def delete_handler(client, message):
     else:
         await message.reply_text("❌ File not found.")
 
-# --- BATCH INDEXING ---
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_channel(client, message):
     if len(message.command) < 2:
-        return await message.reply_text("❌ Usage: `/index https://t.me/channel` or `/index -100xxx`")
+        return await message.reply_text("❌ Usage: `/index https://t.me/channel`")
     
     target = message.command[1]
     status_msg = await message.reply_text(f"⏳ Connecting to {target}...")
-    
     try:
         chat = await client.get_chat(target)
         chat_id = chat.id
@@ -272,7 +288,6 @@ async def index_channel(client, message):
 
     count = 0
     new_files = 0
-    
     try:
         async for msg in client.get_chat_history(chat_id):
             media = msg.document or msg.video
@@ -280,7 +295,6 @@ async def index_channel(client, message):
                 filename = getattr(media, "file_name", None) or "Unknown"
                 if (not filename or filename == "Unknown" or filename.startswith("Video_")) and msg.caption:
                     filename = msg.caption.splitlines()[0]
-                
                 data = {
                     "file_name": filename,
                     "file_size": media.file_size,
@@ -290,11 +304,9 @@ async def index_channel(client, message):
                 }
                 if add_file_to_db(data):
                     new_files += 1
-            
             count += 1
             if count % 200 == 0:
                 await status_msg.edit(f"🔄 Scanned: {count}\n✅ Added: {new_files}")
-                
         await status_msg.edit(f"✅ **Indexing Complete**\n\n📄 Scanned: {count}\n📂 Added: {new_files}")
     except Exception as e:
         await status_msg.edit(f"❌ Indexing Stopped: {e}")
@@ -317,22 +329,23 @@ async def index_new_post(client, message):
     if add_file_to_db(data):
         logger.info(f"✅ Indexed: {filename}")
 
-@app.on_message(filters.text & (filters.private | filters.group))
-async def search_handler(client, message):
-    if message.text.startswith("/") or message.via_bot: return
-    query = message.text.strip()
-    if len(query) < 2: return
+# ==============================================================================
+# MAIN SEARCH LOGIC
+# ==============================================================================
 
-    # 1. Schedule auto-delete for user query
+async def perform_search(client, message, query, is_correction=False):
+    """
+    Reusable function to perform search logic.
+    Handles Exact Search, Suggestions, and UI.
+    """
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
     raw_query = query.lower().split()
     results = []
     
-    # 2. Exact & Split Match
+    # 1. Exact & Split Match
     for file in FILES_CACHE:
-        # We clean the filename here so "Stranger_Things" becomes "stranger things"
         fname = clean_text(file.get('file_name', ''))
         capt = clean_text(file.get('caption', ''))
         
@@ -342,43 +355,87 @@ async def search_handler(client, message):
         if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
 
-    # 3. Fuzzy Search (If exact failed)
-    if FUZZY_AVAILABLE and not results:
-        # Create dictionary of {index: cleaned_filename}
-        choices = {i: clean_text(f.get('file_name', '')) for i, f in enumerate(FILES_CACHE)}
-        
-        # Matches against the Cleaned Query
-        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.token_set_ratio)
-        
-        for match_name, score, index in matches:
-            if score > 55: # Threshold
-                file = FILES_CACHE[index]
-                if file not in results:
-                    results.append(file)
-
-    # 4. No Results Found -> Request Button
-    if not results:
-        btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
-        fail_msg = await message.reply_text(
-            f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it.",
-            reply_markup=InlineKeyboardMarkup(btn)
-        )
-        add_delete_task(message.chat.id, fail_msg.id, time.time() + NOT_FOUND_DELETE_TIME)
+    # 2. IF RESULTS FOUND -> Show Page 1
+    if results:
+        USER_SEARCH_CACHE[message.from_user.id] = results
+        await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=is_correction)
         return
+
+    # 3. NO RESULTS -> GENERATE SUGGESTIONS ("Did you mean?")
+    suggestions = []
+    if FUZZY_AVAILABLE:
+        # We compare user query against cleaned filenames to find possible Titles
+        choices = []
+        for f in FILES_CACHE:
+            # We use the cleaned title for matching to get better "Movie Name" suggestions
+            title = extract_proper_title(f.get('file_name', ''))
+            if title: choices.append(title)
         
-    USER_SEARCH_CACHE[message.from_user.id] = results
-    await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=False)
+        # Get top matches
+        matches = process.extract(clean_query, choices, limit=20, scorer=fuzz.token_set_ratio)
+        
+        seen = set()
+        for match_name, score, index in matches:
+            if score > 60: # Confidence Threshold
+                if match_name not in seen:
+                    suggestions.append(match_name)
+                    seen.add(match_name)
+            if len(suggestions) >= 6: break # Max 6 suggestions
+
+    # 4. SEND RESPONSE (Either Suggestions or Failure)
+    if suggestions:
+        # Create buttons for each suggestion
+        btn = []
+        for sugg in suggestions:
+            # Callback: sp = spell check | sugg = movie name
+            # We restrict length to avoid button errors
+            cb_data = f"sp|{sugg[:30]}"
+            btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
+        
+        btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
+        
+        text = (
+            f"⚠️ **I am not able to search with your given query.**\n"
+            f"Maybe your spelling is wrong.\n\n"
+            f"‼️ **Is there any of this?** 👇"
+        )
+        
+        if is_correction:
+            sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+        else:
+            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
+        
+        # Auto-delete this "suggestion" message after 5 mins
+        add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
+
+    else:
+        # No results, No suggestions
+        btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
+        text = f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it."
+        
+        if is_correction:
+            sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+        else:
+            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
+            
+        add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
+
+@app.on_message(filters.text & (filters.private | filters.group))
+async def search_handler(client, message):
+    if message.text.startswith("/") or message.via_bot: return
+    query = message.text.strip()
+    if len(query) < 2: return
+    
+    await perform_search(client, message, query, is_correction=False)
 
 @app.on_inline_query()
 async def inline_handler(client, query):
     text = query.query.strip()
     if not text: return
-    
     clean_q = clean_text(text)
     raw_q = text.lower().split()
     results = []
     count = 0
-    
     for file in FILES_CACHE:
         if count >= 50: break
         fname = clean_text(file.get('file_name', ''))
@@ -450,7 +507,6 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
         if is_edit:
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            # Send results and schedule auto-delete
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             add_delete_task(sent.chat.id, sent.id, time.time() + USER_MSG_DELETE_TIME)
     except Exception as e:
@@ -477,6 +533,17 @@ async def callback_handler(client, cb):
             await cb.message.delete()
         except:
             await cb.answer("❌ Failed to send request.")
+
+    # --- NEW: HANDLE SPELL CHECK CLICK ---
+    elif data[0] == "sp":
+        correct_query = data[1]
+        await cb.answer()
+        # Perform a fresh search with the clicked name.
+        # We pass cb.message as the message to edit/reply to
+        await perform_search(client, cb.message, correct_query, is_correction=True)
+
+    elif data[0] == "close_data":
+        await cb.message.delete()
 
     elif data[0] == "noop":
         await cb.answer()
