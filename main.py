@@ -170,26 +170,25 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- FIXED TITLE CLEANER ---
+# --- AGGRESSIVE TITLE EXTRACTOR ---
 def extract_proper_title(text):
     """
-    Cleans filenames to just the Movie/Series Name.
-    Fixes: S01, E01, Season 1, Year, etc.
+    1. Replaces all separators (._-) with spaces.
+    2. Cuts text off immediately before: S01, E01, 2024, 720p, etc.
     """
-    # 1. Replace special chars with space
-    text = re.sub(r'[\.\_\[\]\(\)\-]', ' ', text)
+    # 1. Normalize formatting
+    text = re.sub(r'[\.\_\-\[\]\(\)]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     
-    # 2. Regex to find the junk (Case Insensitive)
-    # \b(?: ... )\b ensures it matches whole words/codes
-    # s\d+ matches S1, S01, S100
-    junk_pattern = r'(?i)\b(?:s\d+|e\d+|season|episode|\d{4}|720p|1080p|480p|4k|bluray|web-dl|dvdrip|mkv|mp4|avi|hindi|eng|dual)\b'
+    # 2. Aggressive Regex
+    # Looks for SPACE followed by a keyword (e.g. " S01", " 2024")
+    # This prevents cutting "Avengers" because "s" matches, but " s" (space s) does not.
+    pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
     
-    match = re.search(junk_pattern, text)
+    match = re.search(pattern, text)
     if match:
-        # Cut off text before the first junk match
         text = text[:match.start()]
     
-    # Clean up whitespace
     return text.strip().title()
 
 def get_system_stats():
@@ -372,11 +371,14 @@ async def perform_search(client, message, query, is_correction=False):
         choices = list(unique_titles)
         
         # B. FUZZY MATCH
-        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
+        # Using token_set_ratio which is generally better for partial phrases
+        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.token_set_ratio)
         
         seen = set()
         for match_name, score, index in matches:
-            if score > 50:
+            # INCREASED THRESHOLD TO 65
+            # This ensures "Avngrs" will NOT match "Stranger Things" (score usually ~40)
+            if score > 65:
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
@@ -386,7 +388,7 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Button Text = Clean Name (e.g. "Stranger Things")
+            # Button Text = Clean Name
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
@@ -407,7 +409,7 @@ async def perform_search(client, message, query, is_correction=False):
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
-        # No results, No suggestions
+        # No results, No suggestions (Score < 65)
         btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         text = f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it."
         
@@ -507,6 +509,7 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            # Auto-delete Results List after 10 Minutes
             add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
