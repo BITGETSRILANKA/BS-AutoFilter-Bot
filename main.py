@@ -7,6 +7,7 @@ import threading
 import re
 import time
 import psutil
+import uuid # Imported for Unique IDs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Pyrogram
@@ -69,7 +70,8 @@ if not firebase_admin._apps:
 # 3. GLOBAL VARIABLES & CACHE
 # -----------------------------------------------------------------------------
 FILES_CACHE = []
-USER_SEARCH_CACHE = {}
+# Changed from USER_SEARCH_CACHE to SEARCH_DATA_CACHE to store by Unique ID
+SEARCH_DATA_CACHE = {} 
 BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 
@@ -172,21 +174,12 @@ def clean_text(text):
 
 # --- TITLE CLEANER ---
 def extract_proper_title(text):
-    """
-    Cleans filename to just the title.
-    Example: Avengers.Endgame.2019.720p.mkv -> Avengers Endgame
-    """
-    # 1. Replace special chars with space
     text = re.sub(r'[\.\_\-\[\]\(\)]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    
-    # 2. Cut off at junk keywords
     pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
-    
     match = re.search(pattern, text)
     if match:
         text = text[:match.start()]
-    
     return text.strip().title()
 
 def get_system_stats():
@@ -352,14 +345,16 @@ async def perform_search(client, message, query, is_correction=False):
 
     # 2. IF RESULTS FOUND -> Show File List
     if results:
-        USER_SEARCH_CACHE[message.from_user.id] = results
-        await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=is_correction)
+        # Generate a Unique ID for THIS specific search session
+        search_id = str(uuid.uuid4())[:8] 
+        SEARCH_DATA_CACHE[search_id] = results
+        
+        await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
 
     # 3. SUGGESTIONS
     suggestions = []
     if FUZZY_AVAILABLE:
-        # A. EXTRACT CLEAN TITLES
         unique_titles = set()
         for f in FILES_CACHE:
             clean_t = extract_proper_title(f.get('file_name', ''))
@@ -367,13 +362,10 @@ async def perform_search(client, message, query, is_correction=False):
                 unique_titles.add(clean_t)
         
         choices = list(unique_titles)
-        
-        # B. FUZZY MATCH (WRatio handles short vs long strings best)
         matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
         
         seen = set()
         for match_name, score, index in matches:
-            # Score > 50 captures "Avngrs" -> "Avengers"
             if score > 50:
                 if match_name not in seen:
                     suggestions.append(match_name)
@@ -384,7 +376,6 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Button Text = Clean Name
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
@@ -401,11 +392,10 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
-        # Auto-delete Suggestion after 5 Minutes
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
-        # No results, No suggestions (Score < 50)
+        # No results
         btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         text = f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it."
         
@@ -414,7 +404,6 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
             
-        # Auto-delete "Not Found" Msg after 5 Minutes
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
 @app.on_message(filters.text & (filters.private | filters.group))
@@ -470,8 +459,10 @@ async def send_file_to_user(client, chat_id, unique_id):
     except Exception as e:
         logger.error(f"Send Error: {e}")
 
-async def send_results_page(message, user_id, page=1, is_edit=False):
-    results = USER_SEARCH_CACHE.get(user_id)
+async def send_results_page(message, search_id, page=1, is_edit=False):
+    # Retrieve results using the UNIQUE SEARCH ID
+    results = SEARCH_DATA_CACHE.get(search_id)
+    
     if not results: 
         if is_edit: await message.edit_text("⚠️ Expired. Search again.")
         return
@@ -493,9 +484,15 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
 
     nav = []
-    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{page-1}"))
+    # Buttons now carry the search_id (key) so they know which result list to load
+    if page > 1: 
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
+    
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{page+1}"))
+    
+    if page < total_pages: 
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
+    
     if nav: buttons.append(nav)
     
     text = f"🔍 **Found {total} files**\nPage {page}/{total_pages}"
@@ -505,7 +502,6 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-            # Auto-delete Results List after 10 Minutes
             add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
@@ -519,7 +515,10 @@ async def callback_handler(client, cb):
         await send_file_to_user(client, cb.message.chat.id, data[1])
     
     elif data[0] == "page":
-        await send_results_page(cb.message, user_id=cb.from_user.id, page=int(data[1]), is_edit=True)
+        # Extract Search ID (data[1]) and Page (data[2])
+        search_id = data[1]
+        page_num = int(data[2])
+        await send_results_page(cb.message, search_id, page=page_num, is_edit=True)
     
     elif data[0] == "req":
         query = data[1]
