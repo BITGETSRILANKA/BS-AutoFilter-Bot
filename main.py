@@ -44,9 +44,9 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120   # 2 Minutes (The file itself)
-USER_MSG_DELETE_TIME = 300   # 5 Minutes (User Query & Search Results)
-SUGGESTION_DELETE_TIME = 300 # 5 Minutes (The "Did you mean" message)
+FILE_MSG_DELETE_TIME = 120   # 2 Minutes
+USER_MSG_DELETE_TIME = 300   # 5 Minutes (User Query)
+SUGGESTION_DELETE_TIME = 300 # 5 Minutes (Suggestions Msg)
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -169,27 +169,25 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 def clean_text(text):
-    # Basic cleaning for search comparison
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
+# --- UPDATED TITLE EXTRACTOR ---
 def extract_proper_title(text):
     """
-    Tries to extract the 'Movie Name' from a long filename.
-    Removes S01, E01, 720p, 2024, etc.
-    Input: Stranger_Things_S01E01_720p.mkv
-    Output: Stranger Things
+    Strips junk like S01E01, 2023, 720p, etc to get ONLY the Movie Name.
     """
-    # Replace dots and underscores with spaces
+    # 1. Replace dots/underscores with spaces
     text = re.sub(r'[\._]', ' ', text)
     
-    # Common regex patterns to cut off the title
-    # Stops at: S01, E01, 4 digit year (1999-2029), 720p/1080p, etc
-    pattern = r'(?i)\b(s\d{1,2}|e\d{1,2}|\d{4}|720p|1080p|480p|h264|x264|x265|bluray|web-dl|dvdrip)\b'
+    # 2. Regex to find the START of the "Junk"
+    # Matches: s01, e01, season, episode, 2022 (year), 720p, 1080p, etc.
+    junk_pattern = r'(?i)\b(s\d+|e\d+|season|episode|\d{4}|720p|1080p|480p|h264|x264|x265|bluray|web-dl|dvdrip|mkv|mp4|avi)\b'
     
-    split_text = re.split(pattern, text)
-    if split_text:
-        return split_text[0].strip().title() # Return the part before the junk
-    return text.strip().title()
+    # 3. Split the text at the first occurrence of junk
+    split_text = re.split(junk_pattern, text, maxsplit=1)
+    
+    # 4. Return the first part (The Name) stripped of whitespace
+    return split_text[0].strip().title()
 
 def get_system_stats():
     process = psutil.Process(os.getpid())
@@ -334,10 +332,6 @@ async def index_new_post(client, message):
 # ==============================================================================
 
 async def perform_search(client, message, query, is_correction=False):
-    """
-    Reusable function to perform search logic.
-    Handles Exact Search, Suggestions, and UI.
-    """
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
@@ -355,41 +349,42 @@ async def perform_search(client, message, query, is_correction=False):
         if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
 
-    # 2. IF RESULTS FOUND -> Show Page 1
+    # 2. IF RESULTS FOUND
     if results:
         USER_SEARCH_CACHE[message.from_user.id] = results
         await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=is_correction)
         return
 
-    # 3. NO RESULTS -> GENERATE SUGGESTIONS ("Did you mean?")
+    # 3. SUGGESTIONS ("Did you mean?")
     suggestions = []
     if FUZZY_AVAILABLE:
-        # We compare user query against cleaned filenames to find possible Titles
-        choices = []
-        for f in FILES_CACHE:
-            # We use the cleaned title for matching to get better "Movie Name" suggestions
-            title = extract_proper_title(f.get('file_name', ''))
-            if title: choices.append(title)
+        # Use a Set to store unique CLEAN titles (prevents duplicates like Stranger Things, Stranger Things)
+        unique_titles = set()
         
-        # Get top matches
+        for f in FILES_CACHE:
+            title = extract_proper_title(f.get('file_name', ''))
+            if title and len(title) > 2:
+                unique_titles.add(title)
+        
+        choices = list(unique_titles)
+        
+        # Get top matches against the Clean Titles
         matches = process.extract(clean_query, choices, limit=20, scorer=fuzz.token_set_ratio)
         
         seen = set()
         for match_name, score, index in matches:
-            if score > 60: # Confidence Threshold
+            if score > 50: 
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
-            if len(suggestions) >= 6: break # Max 6 suggestions
+            if len(suggestions) >= 6: break 
 
-    # 4. SEND RESPONSE (Either Suggestions or Failure)
+    # 4. SEND RESPONSE
     if suggestions:
-        # Create buttons for each suggestion
         btn = []
         for sugg in suggestions:
-            # Callback: sp = spell check | sugg = movie name
-            # We restrict length to avoid button errors
-            cb_data = f"sp|{sugg[:30]}"
+            # Button Text = Just the Name (No S01E01)
+            cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
         btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
@@ -405,7 +400,6 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
-        # Auto-delete this "suggestion" message after 5 mins
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
@@ -534,12 +528,9 @@ async def callback_handler(client, cb):
         except:
             await cb.answer("❌ Failed to send request.")
 
-    # --- NEW: HANDLE SPELL CHECK CLICK ---
     elif data[0] == "sp":
         correct_query = data[1]
         await cb.answer()
-        # Perform a fresh search with the clicked name.
-        # We pass cb.message as the message to edit/reply to
         await perform_search(client, cb.message, correct_query, is_correction=True)
 
     elif data[0] == "close_data":
