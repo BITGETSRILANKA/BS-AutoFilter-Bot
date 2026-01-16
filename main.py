@@ -44,8 +44,8 @@ PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
 FILE_MSG_DELETE_TIME = 120   # 2 Minutes
-USER_MSG_DELETE_TIME = 600   # 10 Minutes
-NOT_FOUND_DELETE_TIME = 300  # 5 Minutes (Longer so they can click Request)
+USER_MSG_DELETE_TIME = 600   # 10 Minutes (Search Results)
+NOT_FOUND_DELETE_TIME = 300  # 5 Minutes (No Result Warning)
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -169,6 +169,7 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 def clean_text(text):
+    # This replaces all non-alphanumeric chars (including _) with space
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
 def get_system_stats():
@@ -236,7 +237,7 @@ async def stats_handler(client, message):
     ram = get_system_stats()
     await msg.edit(f"📊 **Bot Stats**\n\n📂 Files: `{files}`\n👤 Users: `{users}`\n💾 RAM: `{ram}`")
 
-# --- [FEATURE 7] DELETE COMMAND ---
+# --- DELETE COMMAND ---
 @app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
 async def delete_handler(client, message):
     unique_id = None
@@ -254,7 +255,7 @@ async def delete_handler(client, message):
     else:
         await message.reply_text("❌ File not found.")
 
-# --- [FEATURE 4] BATCH INDEXING ---
+# --- BATCH INDEXING ---
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_channel(client, message):
     if len(message.command) < 2:
@@ -264,7 +265,6 @@ async def index_channel(client, message):
     status_msg = await message.reply_text(f"⏳ Connecting to {target}...")
     
     try:
-        # Get Chat ID from Link or ID
         chat = await client.get_chat(target)
         chat_id = chat.id
     except Exception as e:
@@ -323,14 +323,16 @@ async def search_handler(client, message):
     query = message.text.strip()
     if len(query) < 2: return
 
+    # 1. Schedule auto-delete for user query
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
     raw_query = query.lower().split()
     results = []
     
-    # 1. Exact & Split Match
+    # 2. Exact & Split Match
     for file in FILES_CACHE:
+        # We clean the filename here so "Stranger_Things" becomes "stranger things"
         fname = clean_text(file.get('file_name', ''))
         capt = clean_text(file.get('caption', ''))
         
@@ -340,21 +342,21 @@ async def search_handler(client, message):
         if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
 
-    # 2. [FEATURE 3] FUZZY SEARCH (If no results or few results)
-    if FUZZY_AVAILABLE and len(results) < 5:
-        # Create a dictionary for rapidfuzz {index: filename}
-        choices = {i: f.get('file_name', '') for i, f in enumerate(FILES_CACHE)}
+    # 3. Fuzzy Search (If exact failed)
+    if FUZZY_AVAILABLE and not results:
+        # Create dictionary of {index: cleaned_filename}
+        choices = {i: clean_text(f.get('file_name', '')) for i, f in enumerate(FILES_CACHE)}
         
-        # Extract top matches
-        matches = process.extract(query, choices, limit=10, scorer=fuzz.token_set_ratio)
+        # Matches against the Cleaned Query
+        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.token_set_ratio)
         
         for match_name, score, index in matches:
-            if score > 60: # Threshold
+            if score > 55: # Threshold
                 file = FILES_CACHE[index]
                 if file not in results:
                     results.append(file)
 
-    # 3. [FEATURE 5] NO RESULTS -> REQUEST BUTTON
+    # 4. No Results Found -> Request Button
     if not results:
         btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         fail_msg = await message.reply_text(
@@ -448,7 +450,7 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
         if is_edit:
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            # Auto-Delete Results after 10 mins
+            # Send results and schedule auto-delete
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
             add_delete_task(sent.chat.id, sent.id, time.time() + USER_MSG_DELETE_TIME)
     except Exception as e:
@@ -466,14 +468,13 @@ async def callback_handler(client, cb):
         await send_results_page(cb.message, user_id=cb.from_user.id, page=int(data[1]), is_edit=True)
     
     elif data[0] == "req":
-        # Handle Request
         query = data[1]
         user = cb.from_user
         text = f"📝 **New Request**\n\n👤 User: {user.mention} (`{user.id}`)\n🎬 Movie: `{query}`"
         try:
             await client.send_message(ADMIN_ID, text)
             await cb.answer("✅ Request Sent to Admin!", show_alert=True)
-            await cb.message.delete() # Delete the "No found" msg
+            await cb.message.delete()
         except:
             await cb.answer("❌ Failed to send request.")
 
