@@ -7,7 +7,7 @@ import threading
 import re
 import time
 import psutil
-import uuid # Imported for Unique IDs
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Pyrogram
@@ -70,7 +70,6 @@ if not firebase_admin._apps:
 # 3. GLOBAL VARIABLES & CACHE
 # -----------------------------------------------------------------------------
 FILES_CACHE = []
-# Changed from USER_SEARCH_CACHE to SEARCH_DATA_CACHE to store by Unique ID
 SEARCH_DATA_CACHE = {} 
 BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
@@ -172,14 +171,26 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- TITLE CLEANER ---
+# --- IMPROVED TITLE CLEANER (Removes @Tags and [Tags]) ---
 def extract_proper_title(text):
-    text = re.sub(r'[\.\_\-\[\]\(\)]', ' ', text)
+    # 1. Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
+    text = re.sub(r'\[.*?\]', '', text)
+    
+    # 2. Remove words starting with @ (e.g. @Netflix_Villa)
+    text = re.sub(r'@\w+', '', text)
+    
+    # 3. Replace separators with space
+    text = re.sub(r'[\.\_\-\(\)]', ' ', text)
+    
+    # 4. Remove extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
+    
+    # 5. Cut off at "Junk" keywords (Year, Season, Quality)
     pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
     match = re.search(pattern, text)
     if match:
         text = text[:match.start()]
+        
     return text.strip().title()
 
 def get_system_stats():
@@ -345,7 +356,7 @@ async def perform_search(client, message, query, is_correction=False):
 
     # 2. IF RESULTS FOUND -> Show File List
     if results:
-        # Generate a Unique ID for THIS specific search session
+        # Generate Unique ID for this search instance
         search_id = str(uuid.uuid4())[:8] 
         SEARCH_DATA_CACHE[search_id] = results
         
@@ -357,6 +368,7 @@ async def perform_search(client, message, query, is_correction=False):
     if FUZZY_AVAILABLE:
         unique_titles = set()
         for f in FILES_CACHE:
+            # THIS IS WHERE IT GETS CLEANED (Removes [Tags] and @Tags)
             clean_t = extract_proper_title(f.get('file_name', ''))
             if len(clean_t) > 2:
                 unique_titles.add(clean_t)
@@ -376,6 +388,7 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
+            # Button Text = Clean Name
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
@@ -460,9 +473,7 @@ async def send_file_to_user(client, chat_id, unique_id):
         logger.error(f"Send Error: {e}")
 
 async def send_results_page(message, search_id, page=1, is_edit=False):
-    # Retrieve results using the UNIQUE SEARCH ID
     results = SEARCH_DATA_CACHE.get(search_id)
-    
     if not results: 
         if is_edit: await message.edit_text("⚠️ Expired. Search again.")
         return
@@ -484,12 +495,9 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
 
     nav = []
-    # Buttons now carry the search_id (key) so they know which result list to load
     if page > 1: 
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
-    
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    
     if page < total_pages: 
         nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
     
@@ -515,7 +523,6 @@ async def callback_handler(client, cb):
         await send_file_to_user(client, cb.message.chat.id, data[1])
     
     elif data[0] == "page":
-        # Extract Search ID (data[1]) and Page (data[2])
         search_id = data[1]
         page_num = int(data[2])
         await send_results_page(cb.message, search_id, page=page_num, is_edit=True)
