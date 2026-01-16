@@ -32,7 +32,7 @@ PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
 FILE_MSG_DELETE_TIME = 120   # 2 Minutes (The movie file)
-USER_MSG_DELETE_TIME = 600   # 10 Minutes (The user's search text)
+USER_MSG_DELETE_TIME = 600   # 10 Minutes (The user's search text AND the result list)
 NOT_FOUND_DELETE_TIME = 20   # 20 Seconds (The "No movie found" alert)
 
 # -----------------------------------------------------------------------------
@@ -413,7 +413,10 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
         if is_edit:
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            # --- MODIFIED HERE ---
+            # Capture the sent message and add to auto-delete queue
+            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            add_delete_task(sent_msg.chat.id, sent_msg.id, time.time() + USER_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
 
