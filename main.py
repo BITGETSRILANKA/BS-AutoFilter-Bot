@@ -11,12 +11,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Pyrogram
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid, ChannelInvalid
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    InlineQueryResultCachedDocument,
-    CallbackQuery
+    InlineQueryResultCachedDocument
 )
 
 # Firebase
@@ -45,8 +43,8 @@ PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
 FILE_MSG_DELETE_TIME = 120   # 2 Minutes
-USER_MSG_DELETE_TIME = 300   # 5 Minutes (User Query)
-SUGGESTION_DELETE_TIME = 300 # 5 Minutes (Suggestions Msg)
+USER_MSG_DELETE_TIME = 300   # 5 Minutes
+SUGGESTION_DELETE_TIME = 300 # 5 Minutes
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -171,23 +169,31 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- UPDATED TITLE EXTRACTOR ---
+# --- IMPROVED TITLE EXTRACTOR ---
 def extract_proper_title(text):
     """
-    Strips junk like S01E01, 2023, 720p, etc to get ONLY the Movie Name.
+    Aggressively strips junk to return ONLY the Movie/Series Name.
+    Works for: "Stranger Things S01E01", "The.Avengers.2012.1080p"
+    Returns: "Stranger Things", "The Avengers"
     """
-    # 1. Replace dots/underscores with spaces
-    text = re.sub(r'[\._]', ' ', text)
+    # 1. Replace brackets, parens, dots, underscores with space
+    text = re.sub(r'[\[\]\(\)\._]', ' ', text)
     
-    # 2. Regex to find the START of the "Junk"
-    # Matches: s01, e01, season, episode, 2022 (year), 720p, 1080p, etc.
-    junk_pattern = r'(?i)\b(s\d+|e\d+|season|episode|\d{4}|720p|1080p|480p|h264|x264|x265|bluray|web-dl|dvdrip|mkv|mp4|avi)\b'
+    # 2. Regex to find the "Cutoff Point"
+    # Stops at: Years (1990-2029), Season/Ep (S01, E01), Resolution (720p, 4k), Codecs, Languages
+    junk_pattern = r'(?i)\b(?:19\d{2}|20\d{2}|s\d+|e\d+|season|episode|720p|1080p|480p|4k|2160p|hevc|x264|x265|bluray|web-dl|webrip|dvdrip|hdrip|camrip|hindi|eng|dual|tam|tel)\b'
     
-    # 3. Split the text at the first occurrence of junk
+    # 3. Split at the first junk keyword
     split_text = re.split(junk_pattern, text, maxsplit=1)
     
-    # 4. Return the first part (The Name) stripped of whitespace
-    return split_text[0].strip().title()
+    # 4. Get the first part
+    title = split_text[0].strip()
+    
+    # 5. If title is too short (less than 2 chars), fallback to original (cleaned)
+    if len(title) < 2:
+        return re.sub(r'\s+', ' ', text).strip()
+        
+    return re.sub(r'\s+', ' ', title).title()
 
 def get_system_stats():
     process = psutil.Process(os.getpid())
@@ -358,9 +364,8 @@ async def perform_search(client, message, query, is_correction=False):
     # 3. SUGGESTIONS ("Did you mean?")
     suggestions = []
     if FUZZY_AVAILABLE:
-        # Use a Set to store unique CLEAN titles (prevents duplicates like Stranger Things, Stranger Things)
+        # Get Unique CLEAN titles from database
         unique_titles = set()
-        
         for f in FILES_CACHE:
             title = extract_proper_title(f.get('file_name', ''))
             if title and len(title) > 2:
@@ -368,12 +373,13 @@ async def perform_search(client, message, query, is_correction=False):
         
         choices = list(unique_titles)
         
-        # Get top matches against the Clean Titles
-        matches = process.extract(clean_query, choices, limit=20, scorer=fuzz.token_set_ratio)
+        # Use WRatio (Weighted Ratio) - It is much better at finding "avngers" -> "Avengers"
+        matches = process.extract(clean_query, choices, limit=20, scorer=fuzz.WRatio)
         
         seen = set()
         for match_name, score, index in matches:
-            if score > 50: 
+            # Score threshold lowered to 45 to catch bad typos
+            if score > 45: 
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
@@ -383,7 +389,7 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Button Text = Just the Name (No S01E01)
+            # Button is just the CLEAN NAME (e.g. "Stranger Things")
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
