@@ -8,15 +8,27 @@ import re
 import time
 import psutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Pyrogram
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
+from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid, ChannelInvalid
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
     InlineQueryResultCachedDocument
 )
+
+# Firebase
 import firebase_admin
 from firebase_admin import credentials, db
+
+# Fuzzy Search
+try:
+    from rapidfuzz import process, fuzz
+    FUZZY_AVAILABLE = True
+except ImportError:
+    print("⚠️ RapidFuzz not installed. Fuzzy search disabled.")
+    FUZZY_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -31,9 +43,9 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120   # 2 Minutes (The movie file)
-USER_MSG_DELETE_TIME = 600   # 10 Minutes (The user's search text AND the result list)
-NOT_FOUND_DELETE_TIME = 20   # 20 Seconds (The "No movie found" alert)
+FILE_MSG_DELETE_TIME = 120   # 2 Minutes
+USER_MSG_DELETE_TIME = 600   # 10 Minutes
+NOT_FOUND_DELETE_TIME = 300  # 5 Minutes (Longer so they can click Request)
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -65,7 +77,6 @@ RESULTS_PER_PAGE = 10
 # 4. DATABASE & HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def refresh_cache():
-    """Loads all files from DB to RAM at startup."""
     global FILES_CACHE
     try:
         ref = db.reference('files')
@@ -77,6 +88,10 @@ def refresh_cache():
         logger.error(f"Cache Refresh Error: {e}")
 
 def add_file_to_db(file_data):
+    # Check duplicates in RAM
+    for f in FILES_CACHE:
+        if f['unique_id'] == file_data['unique_id']:
+            return False
     try:
         ref = db.reference(f'files/{file_data["unique_id"]}')
         ref.set(file_data)
@@ -86,11 +101,21 @@ def add_file_to_db(file_data):
         logger.error(f"DB Write Error: {e}")
         return False
 
+def delete_file_from_db(unique_id):
+    global FILES_CACHE
+    try:
+        db.reference(f'files/{unique_id}').delete()
+        FILES_CACHE = [f for f in FILES_CACHE if f['unique_id'] != unique_id]
+        return True
+    except Exception as e:
+        logger.error(f"DB Delete Error: {e}")
+        return False
+
 def get_file_by_id(unique_id):
     for file in FILES_CACHE:
         if file['unique_id'] == unique_id:
             return file
-    return db.reference(f'files/{unique_id}').get()
+    return None
 
 def add_user(user_id):
     if user_id < 0: return
@@ -105,7 +130,7 @@ def get_all_users():
         return list(snap.keys()) if snap else []
     except: return []
 
-# --- Persistent Auto Delete Logic ---
+# --- Auto Delete Logic ---
 def add_delete_task(chat_id, message_id, delete_time):
     try:
         task_id = f"{chat_id}_{message_id}"
@@ -134,7 +159,6 @@ def remove_delete_task(key):
     try: db.reference(f'delete_queue/{key}').delete()
     except: pass
 
-# --- Utilities ---
 def get_size(size):
     if not size: return "0B"
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -145,7 +169,7 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 def clean_text(text):
-    return re.sub(r'[\W_]+', '', text).lower()
+    return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
 def get_system_stats():
     process = psutil.Process(os.getpid())
@@ -170,14 +194,12 @@ def run_http_server():
 # 6. BACKGROUND TASKS
 # -----------------------------------------------------------------------------
 async def check_auto_delete():
-    """Persistent Auto-Delete Loop"""
     while True:
         try:
             tasks = get_due_delete_tasks()
             for task in tasks:
                 try:
                     await app.delete_messages(task['chat_id'], task['message_id'])
-                    logger.info(f"🗑️ Auto-deleted {task['message_id']}")
                 except Exception: pass
                 remove_delete_task(task['key'])
         except Exception: pass
@@ -190,8 +212,6 @@ async def check_auto_delete():
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
     add_user(message.from_user.id)
-    
-    # Deep Link Check
     if len(message.command) > 1 and message.command[1].startswith("dl_"):
         unique_id = message.command[1].split("_")[1]
         await send_file_to_user(client, message.chat.id, unique_id)
@@ -203,7 +223,7 @@ async def start_handler(client, message):
     ]
     await message.reply_text(
         f"👋 Hi **{message.from_user.first_name}**!\n"
-        "I am a high-speed Auto-Filter Bot.\n"
+        "I am a Pro Auto-Filter Bot.\n"
         "Type a movie name to search.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -216,59 +236,73 @@ async def stats_handler(client, message):
     ram = get_system_stats()
     await msg.edit(f"📊 **Bot Stats**\n\n📂 Files: `{files}`\n👤 Users: `{users}`\n💾 RAM: `{ram}`")
 
-# --- BROADCAST FEATURE ---
-@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID) & filters.reply)
-async def broadcast_handler(client, message):
-    users = get_all_users()
-    if not users:
-        return await message.reply_text("❌ No users found in database.")
-    
-    broadcast_msg = message.reply_to_message
-    status_msg = await message.reply_text(f"🚀 Sending broadcast to {len(users)} users...")
-    
-    success = 0
-    failed = 0
-    done = 0
-    
-    start_time = time.time()
-
-    for user_id in users:
-        try:
-            await broadcast_msg.copy(chat_id=int(user_id))
-            success += 1
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await broadcast_msg.copy(chat_id=int(user_id))
-            success += 1
-        except (InputUserDeactivated, UserIsBlocked, PeerIdInvalid):
-            # Optional: Remove inactive user from DB
-            # db.reference(f'users/{user_id}').delete()
-            failed += 1
-        except Exception as e:
-            failed += 1
+# --- [FEATURE 7] DELETE COMMAND ---
+@app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
+async def delete_handler(client, message):
+    unique_id = None
+    if message.reply_to_message:
+        media = message.reply_to_message.document or message.reply_to_message.video
+        if media: unique_id = media.file_unique_id
+    elif len(message.command) > 1:
+        unique_id = message.command[1]
         
-        done += 1
-        if done % 20 == 0:
-            await status_msg.edit_text(
-                f"📡 **Broadcast in Progress**\n\n"
-                f"✅ Success: {success}\n"
-                f"❌ Failed: {failed}\n"
-                f"📊 Total: {done}/{len(users)}"
-            )
+    if not unique_id:
+        return await message.reply_text("❌ Reply to a file or provide Unique ID.")
+        
+    if delete_file_from_db(unique_id):
+        await message.reply_text(f"🗑️ File `{unique_id}` deleted.")
+    else:
+        await message.reply_text("❌ File not found.")
+
+# --- [FEATURE 4] BATCH INDEXING ---
+@app.on_message(filters.command("index") & filters.user(ADMIN_ID))
+async def index_channel(client, message):
+    if len(message.command) < 2:
+        return await message.reply_text("❌ Usage: `/index https://t.me/channel` or `/index -100xxx`")
+    
+    target = message.command[1]
+    status_msg = await message.reply_text(f"⏳ Connecting to {target}...")
+    
+    try:
+        # Get Chat ID from Link or ID
+        chat = await client.get_chat(target)
+        chat_id = chat.id
+    except Exception as e:
+        return await status_msg.edit(f"❌ Error: {e}")
+
+    count = 0
+    new_files = 0
+    
+    try:
+        async for msg in client.get_chat_history(chat_id):
+            media = msg.document or msg.video
+            if media:
+                filename = getattr(media, "file_name", None) or "Unknown"
+                if (not filename or filename == "Unknown" or filename.startswith("Video_")) and msg.caption:
+                    filename = msg.caption.splitlines()[0]
+                
+                data = {
+                    "file_name": filename,
+                    "file_size": media.file_size,
+                    "file_id": media.file_id,
+                    "unique_id": media.file_unique_id,
+                    "caption": msg.caption or filename 
+                }
+                if add_file_to_db(data):
+                    new_files += 1
             
-    await status_msg.edit_text(
-        f"✅ **Broadcast Completed**\n\n"
-        f"👥 Total Users: {len(users)}\n"
-        f"✅ Success: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"⏱ Time: {int(time.time() - start_time)}s"
-    )
+            count += 1
+            if count % 200 == 0:
+                await status_msg.edit(f"🔄 Scanned: {count}\n✅ Added: {new_files}")
+                
+        await status_msg.edit(f"✅ **Indexing Complete**\n\n📄 Scanned: {count}\n📂 Added: {new_files}")
+    except Exception as e:
+        await status_msg.edit(f"❌ Indexing Stopped: {e}")
 
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
-async def index_handler(client, message):
+async def index_new_post(client, message):
     media = message.document or message.video
     if not media: return
-    
     filename = getattr(media, "file_name", None) or "Unknown"
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         filename = message.caption.splitlines()[0]
@@ -280,47 +314,53 @@ async def index_handler(client, message):
         "unique_id": media.file_unique_id,
         "caption": message.caption or filename 
     }
-    
     if add_file_to_db(data):
         logger.info(f"✅ Indexed: {filename}")
 
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
     if message.text.startswith("/") or message.via_bot: return
-    
     query = message.text.strip()
     if len(query) < 2: return
 
-    # 1. SCHEDULE USER MESSAGE DELETION (10 Minutes)
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
-
-    logger.info(f"🔎 Search: {query} by {message.from_user.id}")
-
-    raw_query = query.lower().split()
+    
     clean_query = clean_text(query)
+    raw_query = query.lower().split()
     results = []
     
+    # 1. Exact & Split Match
     for file in FILES_CACHE:
-        fname_raw = file.get('file_name', '').lower()
-        fname_clean = clean_text(fname_raw)
-        capt_raw = file.get('caption', '').lower()
-        capt_clean = clean_text(capt_raw)
+        fname = clean_text(file.get('file_name', ''))
+        capt = clean_text(file.get('caption', ''))
         
-        if clean_query in fname_clean or clean_query in capt_clean:
+        if clean_query in fname or clean_query in capt:
             results.append(file)
             continue
-        
-        if all(w in fname_raw for w in raw_query):
+        if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
-            
-    # 2. NO RESULTS FOUND LOGIC
+
+    # 2. [FEATURE 3] FUZZY SEARCH (If no results or few results)
+    if FUZZY_AVAILABLE and len(results) < 5:
+        # Create a dictionary for rapidfuzz {index: filename}
+        choices = {i: f.get('file_name', '') for i, f in enumerate(FILES_CACHE)}
+        
+        # Extract top matches
+        matches = process.extract(query, choices, limit=10, scorer=fuzz.token_set_ratio)
+        
+        for match_name, score, index in matches:
+            if score > 60: # Threshold
+                file = FILES_CACHE[index]
+                if file not in results:
+                    results.append(file)
+
+    # 3. [FEATURE 5] NO RESULTS -> REQUEST BUTTON
     if not results:
-        # Reply with "Not Found" then auto-delete that warning
+        btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         fail_msg = await message.reply_text(
-            f"🚫 **No movie found with the name:** `{query}`\n"
-            f"Check spelling or try a different name."
+            f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it.",
+            reply_markup=InlineKeyboardMarkup(btn)
         )
-        # Schedule warning deletion (20 Seconds)
         add_delete_task(message.chat.id, fail_msg.id, time.time() + NOT_FOUND_DELETE_TIME)
         return
         
@@ -339,21 +379,17 @@ async def inline_handler(client, query):
     
     for file in FILES_CACHE:
         if count >= 50: break
-        fname_raw = file.get('file_name', '').lower()
-        fname_clean = clean_text(fname_raw)
-        
-        if clean_q in fname_clean or all(w in fname_raw for w in raw_q):
+        fname = clean_text(file.get('file_name', ''))
+        if clean_q in fname or all(w in file.get('file_name', '').lower() for w in raw_q):
             count += 1
             size = get_size(file['file_size'])
-            clean_caption = f"📁 **{file['file_name']}**\n📊 Size: {size}\n🤖 Bot: @{BOT_USERNAME}"
-            
             results.append(
                 InlineQueryResultCachedDocument(
                     id=file['unique_id'],
                     title=file['file_name'],
                     document_file_id=file['file_id'],
                     description=f"Size: {size}",
-                    caption=clean_caption 
+                    caption=f"📁 **{file['file_name']}**\n📊 Size: {size}"
                 )
             )
     await query.answer(results, cache_time=10)
@@ -366,9 +402,8 @@ async def send_file_to_user(client, chat_id, unique_id):
     caption = (
         f"📁 **{file_data['file_name']}**\n"
         f"📊 Size: {get_size(file_data['file_size'])}\n\n"
-        f"⏳ **This message will be deleted in 2 minutes.**"
+        f"⏳ **Deleted in 2 mins.**"
     )
-    
     try:
         sent = await client.send_cached_media(
             chat_id=chat_id,
@@ -382,7 +417,7 @@ async def send_file_to_user(client, chat_id, unique_id):
 async def send_results_page(message, user_id, page=1, is_edit=False):
     results = USER_SEARCH_CACHE.get(user_id)
     if not results: 
-        if is_edit: await message.edit_text("⚠️ Session expired. Search again.")
+        if is_edit: await message.edit_text("⚠️ Expired. Search again.")
         return
     
     total = len(results)
@@ -413,10 +448,9 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
         if is_edit:
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            # --- MODIFIED HERE ---
-            # Capture the sent message and add to auto-delete queue
-            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-            add_delete_task(sent_msg.chat.id, sent_msg.id, time.time() + USER_MSG_DELETE_TIME)
+            # Auto-Delete Results after 10 mins
+            sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            add_delete_task(sent.chat.id, sent.id, time.time() + USER_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
 
@@ -431,6 +465,18 @@ async def callback_handler(client, cb):
     elif data[0] == "page":
         await send_results_page(cb.message, user_id=cb.from_user.id, page=int(data[1]), is_edit=True)
     
+    elif data[0] == "req":
+        # Handle Request
+        query = data[1]
+        user = cb.from_user
+        text = f"📝 **New Request**\n\n👤 User: {user.mention} (`{user.id}`)\n🎬 Movie: `{query}`"
+        try:
+            await client.send_message(ADMIN_ID, text)
+            await cb.answer("✅ Request Sent to Admin!", show_alert=True)
+            await cb.message.delete() # Delete the "No found" msg
+        except:
+            await cb.answer("❌ Failed to send request.")
+
     elif data[0] == "noop":
         await cb.answer()
 
