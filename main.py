@@ -42,9 +42,10 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120   # 2 Minutes
-USER_MSG_DELETE_TIME = 300   # 5 Minutes
-SUGGESTION_DELETE_TIME = 300 # 5 Minutes
+FILE_MSG_DELETE_TIME = 120     # 2 Minutes (The actual file)
+RESULT_MSG_DELETE_TIME = 600   # 10 Minutes (The "Found 1 files" list) <--- UPDATED
+USER_MSG_DELETE_TIME = 300     # 5 Minutes (The user's text input)     <--- UPDATED
+SUGGESTION_DELETE_TIME = 300   # 5 Minutes (The "Did you mean?" msg)   <--- UPDATED
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -169,31 +170,15 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- IMPROVED TITLE EXTRACTOR ---
+# --- TITLE EXTRACTOR ---
 def extract_proper_title(text):
-    """
-    Aggressively strips junk to return ONLY the Movie/Series Name.
-    Works for: "Stranger Things S01E01", "The.Avengers.2012.1080p"
-    Returns: "Stranger Things", "The Avengers"
-    """
-    # 1. Replace brackets, parens, dots, underscores with space
-    text = re.sub(r'[\[\]\(\)\._]', ' ', text)
-    
-    # 2. Regex to find the "Cutoff Point"
-    # Stops at: Years (1990-2029), Season/Ep (S01, E01), Resolution (720p, 4k), Codecs, Languages
-    junk_pattern = r'(?i)\b(?:19\d{2}|20\d{2}|s\d+|e\d+|season|episode|720p|1080p|480p|4k|2160p|hevc|x264|x265|bluray|web-dl|webrip|dvdrip|hdrip|camrip|hindi|eng|dual|tam|tel)\b'
-    
-    # 3. Split at the first junk keyword
-    split_text = re.split(junk_pattern, text, maxsplit=1)
-    
-    # 4. Get the first part
-    title = split_text[0].strip()
-    
-    # 5. If title is too short (less than 2 chars), fallback to original (cleaned)
-    if len(title) < 2:
-        return re.sub(r'\s+', ' ', text).strip()
-        
-    return re.sub(r'\s+', ' ', title).title()
+    # 1. Replace special chars with space
+    text = re.sub(r'[\.\_\[\]\(\)\-]', ' ', text)
+    # 2. Cutoff at junk keywords
+    match = re.search(r'(?i)\b(?:s\d|e\d|season|episode|\d{4}|720p|1080p|480p|4k|bluray|web-dl|dvdrip|mkv|mp4|avi|hindi|eng|dual)\b', text)
+    if match:
+        text = text[:match.start()]
+    return text.strip().title()
 
 def get_system_stats():
     process = psutil.Process(os.getpid())
@@ -338,6 +323,7 @@ async def index_new_post(client, message):
 # ==============================================================================
 
 async def perform_search(client, message, query, is_correction=False):
+    # Auto-delete User Query after 5 Mins (USER_MSG_DELETE_TIME = 300)
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
@@ -355,31 +341,27 @@ async def perform_search(client, message, query, is_correction=False):
         if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
 
-    # 2. IF RESULTS FOUND
+    # 2. IF RESULTS FOUND -> Show File List
     if results:
         USER_SEARCH_CACHE[message.from_user.id] = results
         await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=is_correction)
         return
 
-    # 3. SUGGESTIONS ("Did you mean?")
+    # 3. SUGGESTIONS
     suggestions = []
     if FUZZY_AVAILABLE:
-        # Get Unique CLEAN titles from database
         unique_titles = set()
         for f in FILES_CACHE:
-            title = extract_proper_title(f.get('file_name', ''))
-            if title and len(title) > 2:
-                unique_titles.add(title)
+            clean_t = extract_proper_title(f.get('file_name', ''))
+            if len(clean_t) > 2:
+                unique_titles.add(clean_t)
         
         choices = list(unique_titles)
-        
-        # Use WRatio (Weighted Ratio) - It is much better at finding "avngers" -> "Avengers"
-        matches = process.extract(clean_query, choices, limit=20, scorer=fuzz.WRatio)
+        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
         
         seen = set()
         for match_name, score, index in matches:
-            # Score threshold lowered to 45 to catch bad typos
-            if score > 45: 
+            if score > 50:
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
@@ -389,7 +371,6 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Button is just the CLEAN NAME (e.g. "Stranger Things")
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
@@ -406,6 +387,7 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
+        # Auto-delete Suggestion after 5 Minutes (SUGGESTION_DELETE_TIME = 300)
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
@@ -418,6 +400,7 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
             
+        # Auto-delete "No found" msg after 5 Minutes
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
 @app.on_message(filters.text & (filters.private | filters.group))
@@ -508,7 +491,8 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-            add_delete_task(sent.chat.id, sent.id, time.time() + USER_MSG_DELETE_TIME)
+            # Auto-delete Results List after 10 Minutes (RESULT_MSG_DELETE_TIME = 600)
+            add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
 
