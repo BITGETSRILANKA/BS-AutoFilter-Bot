@@ -170,19 +170,17 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- AGGRESSIVE TITLE EXTRACTOR ---
+# --- TITLE CLEANER ---
 def extract_proper_title(text):
     """
-    1. Replaces all separators (._-) with spaces.
-    2. Cuts text off immediately before: S01, E01, 2024, 720p, etc.
+    Cleans filename to just the title.
+    Example: Avengers.Endgame.2019.720p.mkv -> Avengers Endgame
     """
-    # 1. Normalize formatting
+    # 1. Replace special chars with space
     text = re.sub(r'[\.\_\-\[\]\(\)]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     
-    # 2. Aggressive Regex
-    # Looks for SPACE followed by a keyword (e.g. " S01", " 2024")
-    # This prevents cutting "Avengers" because "s" matches, but " s" (space s) does not.
+    # 2. Cut off at junk keywords
     pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
     
     match = re.search(pattern, text)
@@ -361,7 +359,7 @@ async def perform_search(client, message, query, is_correction=False):
     # 3. SUGGESTIONS
     suggestions = []
     if FUZZY_AVAILABLE:
-        # A. EXTRACT CLEAN TITLES (SQUASH DUPLICATES)
+        # A. EXTRACT CLEAN TITLES
         unique_titles = set()
         for f in FILES_CACHE:
             clean_t = extract_proper_title(f.get('file_name', ''))
@@ -370,15 +368,13 @@ async def perform_search(client, message, query, is_correction=False):
         
         choices = list(unique_titles)
         
-        # B. FUZZY MATCH
-        # Using token_set_ratio which is generally better for partial phrases
-        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.token_set_ratio)
+        # B. FUZZY MATCH (WRatio handles short vs long strings best)
+        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
         
         seen = set()
         for match_name, score, index in matches:
-            # INCREASED THRESHOLD TO 65
-            # This ensures "Avngrs" will NOT match "Stranger Things" (score usually ~40)
-            if score > 65:
+            # Score > 50 captures "Avngrs" -> "Avengers"
+            if score > 50:
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
@@ -409,7 +405,7 @@ async def perform_search(client, message, query, is_correction=False):
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
-        # No results, No suggestions (Score < 65)
+        # No results, No suggestions (Score < 50)
         btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         text = f"🚫 **No movie found for:** `{query}`\nCheck spelling or request it."
         
