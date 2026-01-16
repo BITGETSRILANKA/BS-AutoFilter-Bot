@@ -42,10 +42,10 @@ FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "")
 PORT = int(os.environ.get('PORT', 8080))
 
 # --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120     # 2 Minutes (The movie file itself)
-RESULT_MSG_DELETE_TIME = 600   # 10 Minutes (The "Found 10 files" list)
-USER_MSG_DELETE_TIME = 300     # 5 Minutes (The user's text input)
-SUGGESTION_DELETE_TIME = 300   # 5 Minutes (The "Did you mean?" message)
+FILE_MSG_DELETE_TIME = 120     # 2 Minutes
+RESULT_MSG_DELETE_TIME = 600   # 10 Minutes
+USER_MSG_DELETE_TIME = 300     # 5 Minutes
+SUGGESTION_DELETE_TIME = 300   # 5 Minutes
 
 # -----------------------------------------------------------------------------
 # 2. LOGGING & FIREBASE SETUP
@@ -170,23 +170,26 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- THE MAGIC FUNCTION (CLEANS TITLES) ---
+# --- FIXED TITLE CLEANER ---
 def extract_proper_title(text):
     """
-    Transforms: "Stranger_Things_S01E05_720p.mkv" 
-    Into: "Stranger Things"
+    Cleans filenames to just the Movie/Series Name.
+    Fixes: S01, E01, Season 1, Year, etc.
     """
-    # 1. Replace dots, underscores, brackets with spaces
+    # 1. Replace special chars with space
     text = re.sub(r'[\.\_\[\]\(\)\-]', ' ', text)
     
-    # 2. Regex to find the start of "Junk" (S01, E01, Year, Quality)
-    # This stops immediately when it sees a season/episode code or year
-    match = re.search(r'(?i)\b(?:s\d|e\d|season|episode|\d{4}|720p|1080p|480p|4k|bluray|web-dl|dvdrip|mkv|mp4|avi|hindi|eng|dual)\b', text)
+    # 2. Regex to find the junk (Case Insensitive)
+    # \b(?: ... )\b ensures it matches whole words/codes
+    # s\d+ matches S1, S01, S100
+    junk_pattern = r'(?i)\b(?:s\d+|e\d+|season|episode|\d{4}|720p|1080p|480p|4k|bluray|web-dl|dvdrip|mkv|mp4|avi|hindi|eng|dual)\b'
     
+    match = re.search(junk_pattern, text)
     if match:
-        # Cut the string before the match starts
+        # Cut off text before the first junk match
         text = text[:match.start()]
     
+    # Clean up whitespace
     return text.strip().title()
 
 def get_system_stats():
@@ -339,7 +342,7 @@ async def perform_search(client, message, query, is_correction=False):
     raw_query = query.lower().split()
     results = []
     
-    # 1. Exact & Split Match (Checks Real Filenames)
+    # 1. Exact & Split Match
     for file in FILES_CACHE:
         fname = clean_text(file.get('file_name', ''))
         capt = clean_text(file.get('caption', ''))
@@ -356,20 +359,16 @@ async def perform_search(client, message, query, is_correction=False):
         await send_results_page(message, user_id=message.from_user.id, page=1, is_edit=is_correction)
         return
 
-    # 3. SUGGESTIONS ("Did you mean?")
+    # 3. SUGGESTIONS
     suggestions = []
     if FUZZY_AVAILABLE:
-        # A. EXTRACT CLEAN TITLES
-        # We use a set() to squash duplicates. 
-        # So "Stranger Things S1", "Stranger Things S2" -> Just "Stranger Things"
+        # A. EXTRACT CLEAN TITLES (SQUASH DUPLICATES)
         unique_titles = set()
         for f in FILES_CACHE:
             clean_t = extract_proper_title(f.get('file_name', ''))
-            # Only add if it looks like a real title (more than 2 chars)
             if len(clean_t) > 2:
                 unique_titles.add(clean_t)
         
-        # Convert set back to list for matching
         choices = list(unique_titles)
         
         # B. FUZZY MATCH
@@ -377,7 +376,7 @@ async def perform_search(client, message, query, is_correction=False):
         
         seen = set()
         for match_name, score, index in matches:
-            if score > 50: # Confidence threshold
+            if score > 50:
                 if match_name not in seen:
                     suggestions.append(match_name)
                     seen.add(match_name)
@@ -387,7 +386,7 @@ async def perform_search(client, message, query, is_correction=False):
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Button Text = CLEAN NAME (e.g., "Stranger Things")
+            # Button Text = Clean Name (e.g. "Stranger Things")
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
         
@@ -404,7 +403,7 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
-        # Auto-delete Suggestion Message after 5 Minutes
+        # Auto-delete Suggestion after 5 Minutes
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
     else:
@@ -417,7 +416,7 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
             
-        # Auto-delete "Not Found" Message after 5 Minutes
+        # Auto-delete "Not Found" Msg after 5 Minutes
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
 @app.on_message(filters.text & (filters.private | filters.group))
@@ -508,7 +507,6 @@ async def send_results_page(message, user_id, page=1, is_edit=False):
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-            # Auto-delete Results List after 10 Minutes
             add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
     except Exception as e:
         logger.error(f"Display Error: {e}")
@@ -538,7 +536,6 @@ async def callback_handler(client, cb):
     elif data[0] == "sp":
         correct_query = data[1]
         await cb.answer()
-        # Searches for the Clean Name (e.g. "Stranger Things")
         await perform_search(client, cb.message, correct_query, is_correction=True)
 
     elif data[0] == "close_data":
