@@ -1,22 +1,7 @@
-import os
-import json
-import math
-import logging
-import asyncio
-import threading
-import re
-import time
-import psutil
-import uuid
+import os, json, math, logging, asyncio, threading, re, time, uuid, psutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# Libraries
 from pyrogram import Client, filters, enums
-from pyrogram.types import (
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton, 
-    InlineQueryResultCachedDocument
-)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import firebase_admin
 from firebase_admin import credentials, db
 from imdb import Cinemagoer 
@@ -34,67 +19,59 @@ DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") 
 PORT = int(os.environ.get('PORT', 8080))
 
-# --- TIMERS (Seconds) ---
-FILE_MSG_DELETE_TIME = 120     # Document file (2 mins)
-RESULT_MSG_DELETE_TIME = 600   # Search Results list (10 mins)
-USER_MSG_DELETE_TIME = 300     # User's search text (5 mins)
-SUGGESTION_DELETE_TIME = 300   # "Did you mean?" menu (5 mins)
+# TIMERS
+FILE_MSG_DELETE_TIME = 120
+RESULT_MSG_DELETE_TIME = 600
+USER_MSG_DELETE_TIME = 300
+SUGGESTION_DELETE_TIME = 300
 
 # -----------------------------------------------------------------------------
 # 2. INITIALIZATION
 # -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s")
 logger = logging.getLogger("BSMoviesBot")
-
 ia = Cinemagoer()
 
 if not firebase_admin._apps:
-    try:
-        cred_dict = json.loads(FIREBASE_KEY)
-        cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
-        logger.info("✅ Firebase Initialized")
-    except Exception as e:
-        logger.error(f"❌ Firebase Init Error: {e}")
+    cred = credentials.Certificate(json.loads(FIREBASE_KEY))
+    firebase_admin.initialize_app(cred, {'databaseURL': DB_URL})
 
 FILES_CACHE = []
 SEARCH_DATA_CACHE = {} 
-BOT_USERNAME = ""
-RESULTS_PER_PAGE = 10
 
 # -----------------------------------------------------------------------------
-# 3. UTILS & CLEANING (AGGRESSIVE)
+# 3. ADVANCED CLEANING MECHANICS (Shobana/AutoFilter Logic)
 # -----------------------------------------------------------------------------
 
-def extract_proper_title(text):
-    """Strips Seasons, Episodes, and Junk to get one clean Movie/Series name."""
-    text = re.sub(r'\[.*?\]|@\w+', '', text) # Remove @tags and [brackets]
+def get_clean_title(text):
+    """The magic function that extracts 'Stranger Things' from messy names."""
+    # 1. Remove website prefixes & tags (Add more here as you find them)
+    text = re.sub(r'(?i)(www|http|https|t\.me|@)\S+', '', text)
+    text = re.sub(r'(?i)(1Tamilmv|Tamilmv|Maptap|Team|Fm|Bsmovies|Bot|Mep|Dvdrip|Brrip)', '', text)
     
-    # Extract Year
-    year_match = re.search(r'\b(19|20)\d{2}\b', text)
-    year_str = f" ({year_match.group(0)})" if year_match else ""
+    # 2. Extract Year
+    year = re.search(r'\b(19|20)\d{2}\b', text)
+    year_str = f" ({year.group(0)})" if year else ""
     
-    # Aggressive patterns for Seasons/Episodes/Quality
-    junk = [
-        r'(?i)\bS\d+\s?E\d+\b', r'(?i)\bS\d+\b', r'(?i)\bE\d+\b',
-        r'(?i)\bSeason\s?\d+\b', r'(?i)\bEpisode\s?\d+\b',
-        r'(?i)\b(720p|1080p|4k|2160p|mkv|mp4|avi|brrip|dvdrip|web|h264|hevc|x264|x265|bluray|hindi|tamil|telugu|english|dual|multi|esub)\b'
-    ]
-    for p in junk:
-        text = re.sub(p, ' ', text)
+    # 3. Remove Season/Episode patterns (S01, E01, Ep 1, Season 1)
+    text = re.sub(r'(?i)\b(S\d+|E\d+|Season\s?\d+|Episode\s?\d+|Ep\s?\d+)\b', '', text)
     
-    text = re.sub(r'[\.\_\-\(\)]', ' ', text)
-    clean_name = re.sub(r'\s+', ' ', text).strip().title()
-    return f"{clean_name}{year_str}".strip()
+    # 4. Remove Quality & Technical tags
+    text = re.sub(r'(?i)\b(720p|1080p|4k|2160p|mkv|mp4|avi|h264|hevc|x264|x265|bluray|hindi|tamil|telugu|english|dual|multi|esub)\b', '', text)
+    
+    # 5. Clean symbols and capitalization
+    text = re.sub(r'[\W_]+', ' ', text)
+    final_title = re.sub(r'\s+', ' ', text).strip().title()
+    
+    return f"{final_title}{year_str}".strip()
 
 def refresh_cache():
     global FILES_CACHE
     try:
-        ref = db.reference('files')
-        snapshot = ref.get()
-        if snapshot: FILES_CACHE = list(snapshot.values())
-        logger.info(f"🚀 Cache Refreshed: {len(FILES_CACHE)} files")
-    except Exception as e: logger.error(f"Cache Error: {e}")
+        snap = db.reference('files').get()
+        if snap: FILES_CACHE = list(snap.values())
+        logger.info(f"🚀 Cached {len(FILES_CACHE)} files")
+    except: pass
 
 def get_size(size):
     if not size: return "0B"
@@ -103,143 +80,98 @@ def get_size(size):
         size /= 1024
     return f"{size:.2f} TB"
 
-def clean_text(text):
-    return re.sub(r'[\W_]+', ' ', text).lower().strip()
-
-# -----------------------------------------------------------------------------
-# 4. DATABASE & SYSTEM HELPERS
-# -----------------------------------------------------------------------------
-
-def add_user(user_id):
-    try:
-        ref = db.reference(f'users/{user_id}')
-        if not ref.get(): ref.set({"active": True})
+def add_delete_task(chat_id, msg_id, d_time):
+    try: db.reference(f'delete_queue/{chat_id}_{msg_id}').set({"chat_id": chat_id, "message_id": msg_id, "delete_time": d_time})
     except: pass
 
-def get_all_users():
-    try:
-        snap = db.reference('users').get()
-        return list(snap.keys()) if snap else []
-    except: return []
-
-def add_delete_task(chat_id, message_id, delete_time):
-    try:
-        db.reference(f'delete_queue/{chat_id}_{message_id}').set({
-            "chat_id": chat_id, "message_id": message_id, "delete_time": delete_time
-        })
-    except: pass
-
-async def check_auto_delete():
-    while True:
-        try:
-            ref = db.reference('delete_queue')
-            tasks = ref.get()
-            now = time.time()
-            if tasks:
-                for k, v in tasks.items():
-                    if v['delete_time'] <= now:
-                        try: await app.delete_messages(v['chat_id'], v['message_id'])
-                        except: pass
-                        ref.child(k).delete()
-        except: pass
-        await asyncio.sleep(15)
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"Alive")
-
-def run_http_server():
-    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
-    server.serve_forever()
-
 # -----------------------------------------------------------------------------
-# 5. SMART SEARCH LOGIC (IMDb + LOCAL FUZZY)
+# 4. SMART SUGGESTION ENGINE (IMDb + Local Rhyme)
 # -----------------------------------------------------------------------------
 
-async def perform_search(client, message, query, is_correction=False):
-    # Timer: Delete User Input in 5 mins
-    add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
-    
-    clean_q = clean_text(query)
-    raw_words = query.lower().split()
-    results = []
-    
-    # Check Database
-    for file in FILES_CACHE:
-        fname = clean_text(file.get('file_name', ''))
-        if clean_q in fname or all(w in fname for w in raw_words):
-            results.append(file)
-
-    if results:
-        search_id = str(uuid.uuid4())[:8] 
-        SEARCH_DATA_CACHE[search_id] = results
-        await send_results_page(message, search_id, page=1, is_edit=is_correction)
-        return
-
-    # Suggestions (Set removes duplicates from multi-episodes)
+async def get_smart_suggestions(query):
     suggestions = set()
+    
+    # 1. IMDb Official Correction (Good for spelling)
     try:
         movies = ia.search_movie(query)
         for m in movies:
             if m.get('kind') in ['movie', 'tv series']:
                 suggestions.add(f"{m.get('title')} ({m.get('year')})" if m.get('year') else m.get('title'))
-            if len(suggestions) >= 4: break
+            if len(suggestions) >= 3: break
     except: pass
 
-    # Local Fuzzy matching against cleaned titles
-    local_titles = list(set([extract_proper_title(f['file_name']) for f in FILES_CACHE]))
-    matches = process.extract(query, local_titles, limit=4, scorer=fuzz.WRatio)
-    for m, score, idx in matches:
-        if score > 55: suggestions.add(m)
-
-    btn = []
-    for s in list(suggestions)[:6]:
-        # Strip Year for search callback
-        search_back = re.sub(r'\(.*?\)', '', s).strip()
-        btn.append([InlineKeyboardButton(s, callback_data=f"sp|{search_back[:40]}")])
+    # 2. Local Fuzzy Rhyme (Good for matching your specific database)
+    # We create a set of UNIQUE clean titles from your files
+    local_titles = list(set([get_clean_title(f['file_name']) for f in FILES_CACHE if len(f['file_name']) > 3]))
     
-    btn.append([InlineKeyboardButton("📝 Request Movie", callback_data=f"req|{query[:30]}")])
+    # Find rhyming/similar titles
+    matches = process.extract(query, local_titles, limit=5, scorer=fuzz.WRatio)
+    for m, score, idx in matches:
+        if score > 55: # Similarity threshold
+            suggestions.add(m)
+            
+    return list(suggestions)[:6]
+
+# -----------------------------------------------------------------------------
+# 5. SEARCH LOGIC
+# -----------------------------------------------------------------------------
+
+async def perform_search(client, message, query, is_correction=False):
+    add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
+    
+    raw_words = query.lower().split()
+    results = []
+    
+    for file in FILES_CACHE:
+        fname = file.get('file_name', '').lower()
+        if all(w in fname for w in raw_words):
+            results.append(file)
+
+    if results:
+        s_id = str(uuid.uuid4())[:8]
+        SEARCH_DATA_CACHE[s_id] = results
+        await send_results_page(message, s_id, page=1, is_edit=is_correction)
+        return
+
+    # No Match -> Show Grouped Suggestions
+    suggestions = await get_smart_suggestions(query)
+    btn = []
+    for s in suggestions:
+        clean_s = re.sub(r'\(.*?\)', '', s).strip() # Strip year for re-search
+        btn.append([InlineKeyboardButton(s, callback_data=f"sp|{clean_s[:40]}")])
+    
+    btn.append([InlineKeyboardButton("📝 Request from Admin", callback_data=f"req|{query[:30]}")])
     btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
     
-    text = f"⚠️ **I couldn't find:** `{query}`\n\n‼️ **Did you mean?** 👇"
-    
-    if is_correction:
-        sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
-    else:
-        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
-    
-    # Timer: Delete Suggestion in 5 mins
+    text = f"⚠️ **No files found for:** `{query}`\n\n‼️ **Is there any of this?** 👇"
+    if is_correction: sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+    else: sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
     add_delete_task(sent.chat.id, sent.id, time.time() + SUGGESTION_DELETE_TIME)
 
-async def send_results_page(message, search_id, page=1, is_edit=False):
-    results = SEARCH_DATA_CACHE.get(search_id)
-    if not results: return
-    total = len(results)
-    total_pages = math.ceil(total / RESULTS_PER_PAGE)
-    start = (page - 1) * RESULTS_PER_PAGE
-    current = results[start : start + RESULTS_PER_PAGE]
+async def send_results_page(message, s_id, page=1, is_edit=False):
+    res = SEARCH_DATA_CACHE.get(s_id)
+    if not res: return
+    total_pages = math.ceil(len(res) / 10)
+    current = res[(page-1)*10 : page*10]
     
-    buttons = []
+    btn = []
     for f in current:
-        size, name = get_size(f['file_size']), f['file_name'][:30]
+        n, s = f['file_name'][:30], get_size(f['file_size'])
         if message.chat.type == enums.ChatType.PRIVATE:
-            buttons.append([InlineKeyboardButton(f"[{size}] {name}", callback_data=f"dl|{f['unique_id']}")])
+            btn.append([InlineKeyboardButton(f"[{s}] {n}", callback_data=f"dl|{f['unique_id']}")])
         else:
-            url = f"https://t.me/{BOT_USERNAME}?start=dl_{f['unique_id']}"
-            buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
+            btn.append([InlineKeyboardButton(f"[{s}] {n}", url=f"https://t.me/{BOT_USERNAME}?start=dl_{f['unique_id']}")])
 
     nav = []
-    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
+    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{s_id}|{page-1}"))
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
-    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
-    if nav: buttons.append(nav)
+    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{s_id}|{page+1}"))
+    if nav: btn.append(nav)
     
-    text = f"🔍 **Found {total} results**"
-    if is_edit:
-        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    text = f"🔍 **Found {len(res)} files**"
+    if is_edit: await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
     else:
-        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-        # Timer: Delete Result list in 10 mins
+        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
 
 # -----------------------------------------------------------------------------
@@ -248,59 +180,34 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
 app = Client("BSMoviesBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 @app.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message):
-    add_user(message.from_user.id)
+async def start(client, message):
     if len(message.command) > 1 and message.command[1].startswith("dl_"):
         uid = message.command[1].split("_")[1]
         for f in FILES_CACHE:
             if f['unique_id'] == uid:
                 sent = await client.send_cached_media(message.chat.id, f['file_id'], caption=f"📁 **{f['file_name']}**")
-                # Timer: Delete actual file in 2 mins
                 add_delete_task(message.chat.id, sent.id, time.time() + FILE_MSG_DELETE_TIME)
                 return
-
     btn = [[InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
            [InlineKeyboardButton("🔎 Inline Search", switch_inline_query_current_chat="")]]
     await message.reply_text(f"👋 Hi **{message.from_user.first_name}**!\nType movie name to search.", reply_markup=InlineKeyboardMarkup(btn))
 
-@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
-async def stats_handler(client, message):
-    u, f = len(get_all_users()), len(FILES_CACHE)
-    await message.reply_text(f"📊 **Stats**\n\n📂 Files: `{f}`\n👤 Users: `{u}`")
-
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
-async def broadcast_handler(client, message):
+async def broadcast(client, message):
     if not message.reply_to_message: return await message.reply_text("Reply to a message.")
-    users = get_all_users()
+    users = list((db.reference('users').get()).keys())
     for u in users:
         try: await message.reply_to_message.copy(int(u)); await asyncio.sleep(0.1)
         except: pass
     await message.reply_text("✅ Done.")
 
-@app.on_message(filters.command("index") & filters.user(ADMIN_ID))
-async def index_channel(client, message):
-    if len(message.command) < 2: return await message.reply_text("Usage: `/index @channel`")
-    target = message.command[1]
-    status = await message.reply_text("⏳ Indexing...")
-    new = 0
-    try:
-        async for msg in client.get_chat_history(target):
-            media = msg.document or msg.video
-            if media:
-                data = {"file_name": getattr(media, "file_name", "Video"), "file_size": media.file_size, "file_id": media.file_id, "unique_id": media.file_unique_id}
-                ref = db.reference(f'files/{media.file_unique_id}')
-                if not ref.get(): ref.set(data); new += 1
-        refresh_cache()
-        await status.edit(f"✅ Added {new} files.")
-    except Exception as e: await status.edit(f"❌ Error: {e}")
-
 @app.on_message(filters.text & (filters.private | filters.group))
-async def search_handler(client, message):
+async def search(client, message):
     if not message.text.startswith("/") and not message.via_bot:
         await perform_search(client, message, message.text.strip())
 
 @app.on_callback_query()
-async def callback_handler(client, cb):
+async def cb_handler(client, cb):
     data = cb.data.split("|")
     if data[0] == "dl":
         for f in FILES_CACHE:
@@ -310,8 +217,6 @@ async def callback_handler(client, cb):
                 await cb.answer(); return
     elif data[0] == "sp":
         await cb.answer(); await perform_search(client, cb.message, data[1], is_correction=True)
-    elif data[0] == "page":
-        await send_results_page(cb.message, data[1], int(data[2]), is_edit=True); await cb.answer()
     elif data[0] == "req":
         btn = [[InlineKeyboardButton("✅ Mark Uploaded", callback_data=f"done|{cb.from_user.id}|{data[1]}")]]
         await client.send_message(ADMIN_ID, f"📝 **Request**\nUser: {cb.from_user.first_name}\nMovie: `{data[1]}`", reply_markup=InlineKeyboardMarkup(btn))
@@ -325,13 +230,27 @@ async def callback_handler(client, cb):
 # -----------------------------------------------------------------------------
 # 7. EXECUTION
 # -----------------------------------------------------------------------------
+async def auto_del():
+    while True:
+        tasks = db.reference('delete_queue').get()
+        if tasks:
+            for k, v in tasks.items():
+                if v['delete_time'] <= time.time():
+                    try: await app.delete_messages(v['chat_id'], v['message_id'])
+                    except: pass
+                    db.reference(f'delete_queue/{k}').delete()
+        await asyncio.sleep(20)
+
 if __name__ == "__main__":
-    threading.Thread(target=run_http_server, daemon=True).start()
+    # Health Check server for hosting providers
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', PORT), H).serve_forever(), daemon=True).start()
+    
     refresh_cache()
     app.start()
     BOT_USERNAME = app.get_me().username
     print(f"🤖 @{BOT_USERNAME} Started")
-    loop = asyncio.get_event_loop()
-    loop.create_task(check_auto_delete())
+    asyncio.get_event_loop().create_task(auto_del())
     from pyrogram import idle
     idle()
