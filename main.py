@@ -9,6 +9,7 @@ import time
 import psutil
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
 
 # Pyrogram
 from pyrogram import Client, filters, enums
@@ -65,23 +66,114 @@ if not firebase_admin._apps:
 # GLOBAL VARIABLES & CACHE
 FILES_CACHE = []
 SEARCH_DATA_CACHE = {}
+MOVIE_TITLES_CACHE = []  # Cache for extracted movie titles
 BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 
 # DATABASE & HELPER FUNCTIONS
 def refresh_cache():
-    global FILES_CACHE
+    global FILES_CACHE, MOVIE_TITLES_CACHE
     try:
         ref = db.reference('files')
         snapshot = ref.get()
         if snapshot:
             FILES_CACHE = list(snapshot.values())
             logger.info(f"🚀 Cache Refreshed: {len(FILES_CACHE)} files in RAM")
+            # Refresh movie titles cache
+            MOVIE_TITLES_CACHE = extract_movie_titles_from_files()
+            logger.info(f"📝 Movie titles extracted: {len(MOVIE_TITLES_CACHE)} unique titles")
         else:
             FILES_CACHE = []
+            MOVIE_TITLES_CACHE = []
             logger.warning("⚠️ No files found in database")
     except Exception as e:
         logger.error(f"Cache Refresh Error: {e}")
+
+def extract_movie_titles_from_files():
+    """Extract unique movie titles from all files in cache"""
+    titles_set = set()
+    
+    for file in FILES_CACHE:
+        filename = file.get('file_name', '')
+        caption = file.get('caption', '')
+        
+        # Try to extract title from filename
+        title_from_filename = extract_proper_movie_title(filename)
+        if title_from_filename:
+            titles_set.add(title_from_filename)
+        
+        # Also try to extract from caption
+        if caption:
+            title_from_caption = extract_proper_movie_title(caption)
+            if title_from_caption:
+                titles_set.add(title_from_caption)
+    
+    # Convert to list and sort alphabetically
+    return sorted(list(titles_set))
+
+def extract_proper_movie_title(text):
+    """Extract clean movie title from text"""
+    if not text:
+        return None
+    
+    # Remove common file extensions
+    text = re.sub(r'\.(mkv|mp4|avi|mov|flv|wmv|webm|m4v|3gp|vob)$', '', text, flags=re.IGNORECASE)
+    
+    # Remove quality info (720p, 1080p, 4K, etc.)
+    text = re.sub(r'[\s\._-]*(720p|1080p|4k|2160p|hd|fullhd|bluray|webdl|webrip|dvdrip|brrip|hdtv|hdcam|camrip|ts|tc|scr|dvdscr|r5|bdrip)[\s\._-]*', ' ', text, flags=re.IGNORECASE)
+    
+    # Remove audio/video codec info
+    text = re.sub(r'[\s\._-]*(x264|x265|h264|h265|aac|ac3|dd5\.1|dts)[\s\._-]*', ' ', text, flags=re.IGNORECASE)
+    
+    # Remove release group names (usually in brackets)
+    text = re.sub(r'\[.*?\]', '', text)
+    
+    # Remove @ tags
+    text = re.sub(r'@\w+', '', text)
+    
+    # Remove special characters and extra spaces
+    text = re.sub(r'[._-]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Try to extract year for better matching
+    year_match = re.search(r'\((\d{4})\)', text)
+    year = year_match.group(1) if year_match else None
+    
+    # Remove year from text for title extraction
+    text_without_year = re.sub(r'\s*\(\d{4}\)', '', text).strip()
+    
+    # Common patterns for movie filenames
+    patterns = [
+        # Pattern: Movie.Name.Year.Quality.mkv
+        r'^([A-Za-z0-9\s\.]+?)(?:\s*\(\d{4}\)|\s+\d{4}|\s+season|\s+episode|\s+s\d+e\d+|\s+part|\s+vol\.|\s+cd\d+|$)',
+        # Pattern: Movie Name - Year - Quality
+        r'^([A-Za-z0-9\s\.\-]+?)(?:\s*-\s*\d{4}|$)',
+    ]
+    
+    for pattern in patterns:
+        match = re.match(pattern, text_without_year, re.IGNORECASE)
+        if match:
+            title = match.group(1).strip()
+            # Clean up the title
+            title = re.sub(r'\.', ' ', title)  # Replace dots with spaces
+            title = re.sub(r'\s+', ' ', title).strip()
+            
+            # Add year back if it exists
+            if year and title:
+                title = f"{title} ({year})"
+            
+            # Only return titles that are reasonable length
+            if title and len(title) > 2 and len(title.split()) <= 10:
+                return title.title()
+    
+    # If no pattern matched, return cleaned text (limited)
+    if text_without_year and len(text_without_year.split()) <= 10:
+        result = text_without_year.title()
+        if year:
+            result = f"{result} ({year})"
+        return result
+    
+    return None
 
 def add_file_to_db(file_data):
     for f in FILES_CACHE:
@@ -91,6 +183,9 @@ def add_file_to_db(file_data):
         ref = db.reference(f'files/{file_data["unique_id"]}')
         ref.set(file_data)
         FILES_CACHE.append(file_data)
+        # Update movie titles cache
+        global MOVIE_TITLES_CACHE
+        MOVIE_TITLES_CACHE = extract_movie_titles_from_files()
         logger.info(f"✅ Added file: {file_data['file_name'][:50]}")
         return True
     except Exception as e:
@@ -98,10 +193,12 @@ def add_file_to_db(file_data):
         return False
 
 def delete_file_from_db(unique_id):
-    global FILES_CACHE
+    global FILES_CACHE, MOVIE_TITLES_CACHE
     try:
         db.reference(f'files/{unique_id}').delete()
         FILES_CACHE = [f for f in FILES_CACHE if f['unique_id'] != unique_id]
+        # Update movie titles cache
+        MOVIE_TITLES_CACHE = extract_movie_titles_from_files()
         logger.info(f"🗑️ Deleted file: {unique_id}")
         return True
     except Exception as e:
@@ -180,15 +277,15 @@ def clean_text(text):
         return ""
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
-# --- IMPROVED TITLE CLEANER (Removes @Tags and [Tags]) ---
+# --- TITLE CLEANER ---
 def extract_proper_title(text):
     if not text:
         return ""
     
-    # Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
+    # Remove stuff inside [ brackets ]
     text = re.sub(r'\[.*?\]', '', text)
     
-    # Remove words starting with @ (e.g. @Netflix_Villa)
+    # Remove @ tags
     text = re.sub(r'@\w+', '', text)
     
     # Replace separators with space
@@ -197,7 +294,7 @@ def extract_proper_title(text):
     # Remove extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
     
-    # Cut off at "Junk" keywords (Year, Season, Quality)
+    # Cut off at common keywords
     pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
     match = re.search(pattern, text)
     if match:
@@ -220,7 +317,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is Running")
     
     def log_message(self, format, *args):
-        pass  # Disable default logging
+        pass
 
 def run_http_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
@@ -268,7 +365,8 @@ async def stats_handler(client, message):
     files = len(FILES_CACHE)
     users = len(get_all_users())
     ram = get_system_stats()
-    await msg.edit(f"📊 Bot Stats\n\n📂 Files: {files}\n👤 Users: {users}\n💾 RAM: {ram}")
+    titles = len(MOVIE_TITLES_CACHE)
+    await msg.edit(f"📊 Bot Stats\n\n📂 Files: {files}\n🎬 Titles: {titles}\n👤 Users: {users}\n💾 RAM: {ram}")
 
 @app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
 async def delete_handler(client, message):
@@ -310,9 +408,7 @@ async def index_channel(client, message):
                 media = msg.document or msg.video
                 filename = getattr(media, "file_name", None) or "Unknown"
                 
-                # Try to get filename from caption if missing
                 if (not filename or filename == "Unknown" or filename.startswith("Video_")) and msg.caption:
-                    # Extract first line from caption as filename
                     caption_lines = msg.caption.split('\n')
                     if caption_lines:
                         filename = caption_lines[0].strip()
@@ -342,7 +438,6 @@ async def index_new_post(client, message):
     
     filename = getattr(media, "file_name", None) or "Unknown"
     
-    # Try to get filename from caption if missing
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         caption_lines = message.caption.split('\n')
         if caption_lines:
@@ -360,10 +455,82 @@ async def index_new_post(client, message):
     else:
         logger.info(f"⚠️ Already indexed: {filename}")
 
+# FUNCTION TO GET REAL SUGGESTIONS FROM DATABASE
+def get_suggestions_from_query(query, max_suggestions=6):
+    """Get real movie suggestions that actually exist in database"""
+    suggestions = []
+    
+    if not query or not MOVIE_TITLES_CACHE or not FUZZY_AVAILABLE:
+        return suggestions
+    
+    try:
+        # Use fuzzy matching to find similar movie titles
+        matches = process.extract(
+            query.lower(),
+            MOVIE_TITLES_CACHE,
+            scorer=fuzz.WRatio,
+            limit=20,  # Get more matches to filter
+            score_cutoff=40
+        )
+        
+        # Sort by score (highest first)
+        matches.sort(key=lambda x: x[1], reverse=True)
+        
+        # Filter and get unique suggestions
+        seen_titles = set()
+        for title, score, _ in matches:
+            if score > 45:  # Reasonable match threshold
+                # Remove year for deduplication
+                base_title = re.sub(r'\s*\(\d{4}\)', '', title).strip()
+                if base_title not in seen_titles:
+                    # Verify this title actually has files in database
+                    if verify_title_has_files(title):
+                        suggestions.append(title)
+                        seen_titles.add(base_title)
+                
+                if len(suggestions) >= max_suggestions:
+                    break
+        
+        # If we don't have enough suggestions, try partial matching
+        if len(suggestions) < max_suggestions:
+            clean_query = clean_text(query)
+            for title in MOVIE_TITLES_CACHE:
+                if len(suggestions) >= max_suggestions:
+                    break
+                clean_title = clean_text(title)
+                if clean_query in clean_title and title not in suggestions:
+                    if verify_title_has_files(title):
+                        suggestions.append(title)
+        
+    except Exception as e:
+        logger.error(f"Error in suggestion search: {e}")
+    
+    return suggestions
+
+def verify_title_has_files(title):
+    """Verify that a movie title actually has files in the database"""
+    # Remove year for matching
+    title_without_year = re.sub(r'\s*\(\d{4}\)', '', title).strip().lower()
+    
+    for file in FILES_CACHE:
+        filename = file.get('file_name', '').lower()
+        caption = file.get('caption', '').lower()
+        
+        # Check if title (without year) is in filename or caption
+        if title_without_year in filename or title_without_year in caption:
+            return True
+        
+        # Also check with extracted movie title
+        extracted_title = extract_proper_movie_title(file.get('file_name', ''))
+        if extracted_title and title_without_year in extracted_title.lower():
+            return True
+    
+    return False
+
 # MAIN SEARCH LOGIC
 async def perform_search(client, message, query, is_correction=False):
     if not query or len(query) < 2:
-        return
+        return await message.reply_text("❌ Query too short. Enter at least 2 characters.")
     
     # Auto-delete User Input after 5 Minutes
     if not is_correction:
@@ -373,7 +540,7 @@ async def perform_search(client, message, query, is_correction=False):
     raw_query = query.lower().split()
     results = []
     
-    # 1. Exact & Split Match
+    # 1. Search for exact matches
     for file in FILES_CACHE:
         fname = clean_text(file.get('file_name', ''))
         capt = clean_text(file.get('caption', ''))
@@ -384,66 +551,51 @@ async def perform_search(client, message, query, is_correction=False):
         
         if raw_query and all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
+            continue
+        
+        # Check extracted movie title
+        extracted_title = extract_proper_movie_title(file.get('file_name', ''))
+        if extracted_title and clean_query in extracted_title.lower():
+            results.append(file)
+            continue
     
     # 2. IF RESULTS FOUND -> Show File List
     if results:
-        # Generate Unique ID for this search instance
         search_id = str(uuid.uuid4())[:8]
         SEARCH_DATA_CACHE[search_id] = results
         
         await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
     
-    # 3. SUGGESTIONS
-    suggestions = []
-    if FUZZY_AVAILABLE and clean_query:
-        unique_titles = set()
-        for f in FILES_CACHE:
-            # THIS IS WHERE IT GETS CLEANED (Removes [Tags] and @Tags)
-            clean_t = extract_proper_title(f.get('file_name', ''))
-            if len(clean_t) > 2:
-                unique_titles.add(clean_t)
-        
-        if unique_titles:
-            choices = list(unique_titles)
-            matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
-            
-            seen = set()
-            for match_name, score, index in matches:
-                if score > 50:
-                    if match_name not in seen:
-                        suggestions.append(match_name)
-                        seen.add(match_name)
-                if len(suggestions) >= 6: 
-                    break
+    # 3. NO RESULTS - SHOW SUGGESTIONS WITH REAL MOVIE NAMES
+    suggestions = get_suggestions_from_query(query)
     
-    # 4. SEND RESPONSE
     if suggestions:
-        btn = []
+        # Create buttons with suggestions
+        buttons = []
         for sugg in suggestions:
-            # Button Text = Clean Name
-            cb_data = f"sp|{sugg[:40]}"
-            btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
+            cb_data = f"suggest|{sugg}"
+            buttons.append([InlineKeyboardButton(f"🎬 {sugg}", callback_data=cb_data)])
         
-        btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
+        buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_data")])
         
         text = (
-            f"⚠️ I am not able to search with your given query.\n"
-            f"Maybe your spelling is wrong.\n\n"
-            f"‼️ Is there any of this? 👇"
+            f"🤔 **No exact matches found for:** `{query}`\n\n"
+            f"**Did you mean any of these?** 👇\n"
+            f"_These are real movies available in database_"
         )
         
         if is_correction:
-            sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+            sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         else:
-            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
+            sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
         
         add_delete_task(sent_msg.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
     
     else:
-        # No results
-        btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
-        text = f"🚫 No movie found for: {query}\nCheck spelling or request it."
+        # No results and no suggestions
+        btn = [[InlineKeyboardButton(f"📝 Request '{query[:15]}...'", callback_data=f"req|{query[:20]}")]]
+        text = f"🚫 **No results found for:** `{query}`\n\nCheck spelling or request this content."
         
         if is_correction:
             sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
@@ -461,7 +613,19 @@ async def search_handler(client, message):
     if len(query) < 2: 
         return await message.reply_text("❌ Query too short. Enter at least 2 characters.")
     
-    await perform_search(client, message, query, is_correction=False)
+    status_msg = await message.reply_text(f"🔍 Searching: `{query}`...")
+    
+    try:
+        await perform_search(client, message, query, is_correction=False)
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await message.reply_text(f"❌ Error during search: {e}")
+    
+    try:
+        await asyncio.sleep(1)
+        await status_msg.delete()
+    except:
+        pass
 
 @app.on_inline_query()
 async def inline_handler(client, query):
@@ -494,7 +658,6 @@ async def inline_handler(client, query):
             )
             continue
         
-        # Also check with split words
         if raw_q and all(w in file.get('file_name', '').lower() for w in raw_q):
             count += 1
             size = get_size(file['file_size'])
@@ -546,7 +709,7 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
         return
     
     total_pages = math.ceil(total / RESULTS_PER_PAGE)
-    page = max(1, min(page, total_pages))  # Ensure page is within bounds
+    page = max(1, min(page, total_pages))
     
     start = (page - 1) * RESULTS_PER_PAGE
     end = start + RESULTS_PER_PAGE
@@ -567,7 +730,6 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
             url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
     
-    # Navigation buttons
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page|{search_id}|{page-1}"))
@@ -580,8 +742,7 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
     if nav: 
         buttons.append(nav)
     
-    # Add close button
-    buttons.append([InlineKeyboardButton("🚫 Close", callback_data="close_data")])
+    buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_data")])
     
     text = f"🔍 **Found {total} files**\n📄 Page {page}/{total_pages}"
     
@@ -599,7 +760,7 @@ async def callback_handler(client, cb):
     data = cb.data.split("|")
     
     if data[0] == "dl":
-        await cb.answer()
+        await cb.answer("📥 Downloading file...")
         await send_file_to_user(client, cb.message.chat.id, data[1])
     
     elif data[0] == "page":
@@ -611,7 +772,7 @@ async def callback_handler(client, cb):
     elif data[0] == "req":
         query = data[1]
         user = cb.from_user
-        text = f"📝 New Request\n\n👤 User: {user.mention} ({user.id})\n🎬 Movie: {query}"
+        text = f"📝 **New Request**\n\n👤 User: {user.mention} (`{user.id}`)\n🎬 Request: `{query}`\n⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         try:
             await client.send_message(ADMIN_ID, text)
             await cb.answer("✅ Request Sent to Admin!", show_alert=True)
@@ -620,10 +781,11 @@ async def callback_handler(client, cb):
             await cb.answer("❌ Failed to send request.", show_alert=True)
             logger.error(f"Request error: {e}")
     
-    elif data[0] == "sp":
-        correct_query = data[1]
-        await cb.answer()
-        await perform_search(client, cb.message, correct_query, is_correction=True)
+    elif data[0] == "suggest":
+        suggested_query = data[1]
+        await cb.answer(f"🔍 Searching: {suggested_query}")
+        await cb.message.edit_text(f"🔍 Searching: `{suggested_query}`...")
+        await perform_search(client, cb.message, suggested_query, is_correction=True)
     
     elif data[0] == "close_data":
         await cb.message.delete()
@@ -632,7 +794,7 @@ async def callback_handler(client, cb):
     elif data[0] == "noop":
         await cb.answer()
 
-# BROADCAST COMMAND (ADD THIS)
+# BROADCAST COMMAND
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
 async def broadcast_handler(client, message):
     if not message.reply_to_message:
@@ -656,17 +818,13 @@ async def broadcast_handler(client, message):
             failed += 1
             logger.error(f"Broadcast failed for {user_id}: {e}")
         
-        # Small delay to avoid flood
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
     
-    await status.edit(f"✅ Broadcast Complete\n\n✅ Success: {success}\n❌ Failed: {failed}")
+    await status.edit(f"✅ **Broadcast Complete**\n\n✅ Success: `{success}`\n❌ Failed: `{failed}`")
 
 # MAIN EXECUTION
 if __name__ == "__main__":
-    # Start HTTP server in background
     threading.Thread(target=run_http_server, daemon=True).start()
-    
-    # Refresh cache from Firebase
     refresh_cache()
     
     print("🤖 Bot Starting...")
@@ -681,6 +839,7 @@ if __name__ == "__main__":
     print(f"✅ Bot Started as @{BOT_USERNAME}")
     print(f"🌐 HTTP Server running on port {PORT}")
     print(f"📂 Files in cache: {len(FILES_CACHE)}")
+    print(f"🎬 Movie titles extracted: {len(MOVIE_TITLES_CACHE)}")
     
     from pyrogram import idle
     idle()
