@@ -3,4 +3,4 @@ TgCrypto>=1.2.5
 firebase-admin>=6.2.0
 psutil
 rapidfuzz
-tmdbv3api
+cinemagoer
