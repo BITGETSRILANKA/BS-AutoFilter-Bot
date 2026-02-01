@@ -10,7 +10,7 @@ import psutil
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# --- Pyrogram ---
+# Pyrogram
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardMarkup,
@@ -18,11 +18,11 @@ from pyrogram.types import (
     InlineQueryResultCachedDocument
 )
 
-# --- Firebase ---
+# Firebase
 import firebase_admin
 from firebase_admin import credentials, db
 
-# --- Fuzzy Search ---
+# Fuzzy Search
 try:
     from rapidfuzz import process, fuzz
     FUZZY_AVAILABLE = True
@@ -30,7 +30,7 @@ except ImportError:
     print("⚠️ RapidFuzz not installed. Fuzzy search disabled.")
     FUZZY_AVAILABLE = False
 
-# --- CONFIGURATION ---
+# CONFIGURATION
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -46,7 +46,7 @@ RESULT_MSG_DELETE_TIME = 600   # 10 Minutes
 USER_MSG_DELETE_TIME = 300     # 5 Minutes
 SUGGESTION_DELETE_TIME = 300   # 5 Minutes
 
-# --- LOGGING & FIREBASE SETUP ---
+# LOGGING & FIREBASE SETUP
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("BSFilterBot")
 
@@ -62,14 +62,13 @@ if not firebase_admin._apps:
     except Exception as e:
         logger.error(f"❌ Firebase Init Error: {e}")
 
-# --- GLOBAL VARIABLES & CACHE ---
+# GLOBAL VARIABLES & CACHE
 FILES_CACHE = []
 SEARCH_DATA_CACHE = {}
 BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 
-# --- DATABASE & HELPER FUNCTIONS ---
-
+# DATABASE & HELPER FUNCTIONS
 def refresh_cache():
     global FILES_CACHE
     try:
@@ -124,7 +123,6 @@ def get_all_users():
     except: return []
 
 # --- Auto Delete Logic ---
-
 def add_delete_task(chat_id, message_id, delete_time):
     try:
         task_id = f"{chat_id}_{message_id}"
@@ -166,11 +164,10 @@ def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
 # --- IMPROVED TITLE CLEANER (Removes @Tags and [Tags]) ---
-
 def extract_proper_title(text):
     # 1. Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
     text = re.sub(r'\[.*?\]', '', text)
-    
+
     # 2. Remove words starting with @ (e.g. @Netflix_Villa)
     text = re.sub(r'@\w+', '', text)
 
@@ -192,8 +189,7 @@ def get_system_stats():
     process = psutil.Process(os.getpid())
     return get_size(process.memory_info().rss)
 
-# --- BOT CLIENT & HTTP SERVER ---
-
+# BOT CLIENT & HTTP SERVER
 app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -206,8 +202,7 @@ def run_http_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
     server.serve_forever()
 
-# --- BACKGROUND TASKS ---
-
+# BACKGROUND TASKS
 async def check_auto_delete():
     while True:
         try:
@@ -220,8 +215,7 @@ async def check_auto_delete():
         except Exception: pass
         await asyncio.sleep(10)
 
-# --- BOT HANDLERS ---
-
+# BOT HANDLERS
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
     add_user(message.from_user.id)
@@ -300,7 +294,6 @@ async def index_channel(client, message):
                 count += 1
                 if count % 200 == 0:
                     await status_msg.edit(f"🔄 Scanned: {count}\n✅ Added: {new_files}")
-        
         await status_msg.edit(f"✅ Indexing Complete\n\n📄 Scanned: {count}\n📂 Added: {new_files}")
     except Exception as e:
         await status_msg.edit(f"❌ Indexing Stopped: {e}")
@@ -323,9 +316,9 @@ async def index_new_post(client, message):
     if add_file_to_db(data):
         logger.info(f"✅ Indexed: {filename}")
 
-# --- MAIN SEARCH LOGIC ---
-
+# MAIN SEARCH LOGIC
 async def perform_search(client, message, query, is_correction=False):
+
     # Auto-delete User Input after 5 Minutes
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
 
@@ -349,6 +342,7 @@ async def perform_search(client, message, query, is_correction=False):
         # Generate Unique ID for this search instance
         search_id = str(uuid.uuid4())[:8]
         SEARCH_DATA_CACHE[search_id] = results
+
         await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
 
@@ -537,12 +531,11 @@ async def callback_handler(client, cb):
     elif data[0] == "noop":
         await cb.answer()
 
-# --- MAIN EXECUTION ---
-
+# MAIN EXECUTION
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
     refresh_cache()
-    
+
     print("🤖 Bot Starting...")
     app.start()
 
