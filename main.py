@@ -34,17 +34,17 @@ DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") 
 PORT = int(os.environ.get('PORT', 8080))
 
-# Timers
-FILE_MSG_DELETE_TIME = 120
-RESULT_MSG_DELETE_TIME = 600
-USER_MSG_DELETE_TIME = 300
-SUGGESTION_DELETE_TIME = 300
+# --- TIMERS (Seconds) ---
+FILE_MSG_DELETE_TIME = 120     # Document file (2 mins)
+RESULT_MSG_DELETE_TIME = 600   # Search Results list (10 mins)
+USER_MSG_DELETE_TIME = 300     # User's search text (5 mins)
+SUGGESTION_DELETE_TIME = 300   # "Did you mean?" menu (5 mins)
 
 # -----------------------------------------------------------------------------
 # 2. INITIALIZATION
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("BSFilterBot")
+logger = logging.getLogger("BSMoviesBot")
 
 ia = Cinemagoer()
 
@@ -63,19 +63,29 @@ BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS & CLEANER
+# 3. UTILS & CLEANING (AGGRESSIVE)
 # -----------------------------------------------------------------------------
 
 def extract_proper_title(text):
-    """Turns messy filenames into Clean Movie (Year)"""
-    text = re.sub(r'\[.*?\]|@\w+', '', text) # Remove tags
+    """Strips Seasons, Episodes, and Junk to get one clean Movie/Series name."""
+    text = re.sub(r'\[.*?\]|@\w+', '', text) # Remove @tags and [brackets]
+    
+    # Extract Year
     year_match = re.search(r'\b(19|20)\d{2}\b', text)
-    year = f" ({year_match.group(0)})" if year_match else ""
-    junk = r'(?i)\b(720p|1080p|4k|mkv|mp4|avi|hindi|tamil|telugu|eng|dual|brrip|dvdrip|web|h264|hevc|x264|x265)\b'
-    text = re.sub(junk, ' ', text)
+    year_str = f" ({year_match.group(0)})" if year_match else ""
+    
+    # Aggressive patterns for Seasons/Episodes/Quality
+    junk = [
+        r'(?i)\bS\d+\s?E\d+\b', r'(?i)\bS\d+\b', r'(?i)\bE\d+\b',
+        r'(?i)\bSeason\s?\d+\b', r'(?i)\bEpisode\s?\d+\b',
+        r'(?i)\b(720p|1080p|4k|2160p|mkv|mp4|avi|brrip|dvdrip|web|h264|hevc|x264|x265|bluray|hindi|tamil|telugu|english|dual|multi|esub)\b'
+    ]
+    for p in junk:
+        text = re.sub(p, ' ', text)
+    
     text = re.sub(r'[\.\_\-\(\)]', ' ', text)
     clean_name = re.sub(r'\s+', ' ', text).strip().title()
-    return f"{clean_name}{year}".strip()
+    return f"{clean_name}{year_str}".strip()
 
 def refresh_cache():
     global FILES_CACHE
@@ -96,6 +106,10 @@ def get_size(size):
 def clean_text(text):
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
+# -----------------------------------------------------------------------------
+# 4. DATABASE & SYSTEM HELPERS
+# -----------------------------------------------------------------------------
+
 def add_user(user_id):
     try:
         ref = db.reference(f'users/{user_id}')
@@ -107,20 +121,6 @@ def get_all_users():
         snap = db.reference('users').get()
         return list(snap.keys()) if snap else []
     except: return []
-
-# -----------------------------------------------------------------------------
-# 4. HEALTH CHECK & BACKGROUND TASKS
-# -----------------------------------------------------------------------------
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot Running")
-
-def run_http_server():
-    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
-    server.serve_forever()
 
 def add_delete_task(chat_id, message_id, delete_time):
     try:
@@ -144,16 +144,27 @@ async def check_auto_delete():
         except: pass
         await asyncio.sleep(15)
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"Alive")
+
+def run_http_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+    server.serve_forever()
+
 # -----------------------------------------------------------------------------
-# 5. SEARCH LOGIC
+# 5. SMART SEARCH LOGIC (IMDb + LOCAL FUZZY)
 # -----------------------------------------------------------------------------
 
 async def perform_search(client, message, query, is_correction=False):
+    # Timer: Delete User Input in 5 mins
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
+    
     clean_q = clean_text(query)
     raw_words = query.lower().split()
     results = []
     
+    # Check Database
     for file in FILES_CACHE:
         fname = clean_text(file.get('file_name', ''))
         if clean_q in fname or all(w in fname for w in raw_words):
@@ -165,32 +176,39 @@ async def perform_search(client, message, query, is_correction=False):
         await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
 
-    # SUGGESTIONS (IMDb + Local Fuzzy)
-    suggestions = []
+    # Suggestions (Set removes duplicates from multi-episodes)
+    suggestions = set()
     try:
         movies = ia.search_movie(query)
         for m in movies:
             if m.get('kind') in ['movie', 'tv series']:
-                suggestions.append(f"{m.get('title')} ({m.get('year')})" if m.get('year') else m.get('title'))
-            if len(suggestions) >= 3: break
+                suggestions.add(f"{m.get('title')} ({m.get('year')})" if m.get('year') else m.get('title'))
+            if len(suggestions) >= 4: break
     except: pass
 
+    # Local Fuzzy matching against cleaned titles
     local_titles = list(set([extract_proper_title(f['file_name']) for f in FILES_CACHE]))
-    matches = process.extract(query, local_titles, limit=3, scorer=fuzz.WRatio)
+    matches = process.extract(query, local_titles, limit=4, scorer=fuzz.WRatio)
     for m, score, idx in matches:
-        if score > 55 and m not in suggestions: suggestions.append(m)
+        if score > 55: suggestions.add(m)
 
     btn = []
-    for s in suggestions[:6]:
-        cb_search = re.sub(r'\(.*?\)', '', s).strip()
-        btn.append([InlineKeyboardButton(s, callback_data=f"sp|{cb_search[:40]}")])
+    for s in list(suggestions)[:6]:
+        # Strip Year for search callback
+        search_back = re.sub(r'\(.*?\)', '', s).strip()
+        btn.append([InlineKeyboardButton(s, callback_data=f"sp|{search_back[:40]}")])
     
     btn.append([InlineKeyboardButton("📝 Request Movie", callback_data=f"req|{query[:30]}")])
     btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
     
-    text = f"⚠️ **I couldn't find:** `{query}`\nMaybe spelling is wrong.\n\n‼️ **Did you mean?** 👇"
-    if is_correction: sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
-    else: sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
+    text = f"⚠️ **I couldn't find:** `{query}`\n\n‼️ **Did you mean?** 👇"
+    
+    if is_correction:
+        sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
+    else:
+        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
+    
+    # Timer: Delete Suggestion in 5 mins
     add_delete_task(sent.chat.id, sent.id, time.time() + SUGGESTION_DELETE_TIME)
 
 async def send_results_page(message, search_id, page=1, is_edit=False):
@@ -207,7 +225,8 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
         if message.chat.type == enums.ChatType.PRIVATE:
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", callback_data=f"dl|{f['unique_id']}")])
         else:
-            buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=f"https://t.me/{BOT_USERNAME}?start=dl_{f['unique_id']}")])
+            url = f"https://t.me/{BOT_USERNAME}?start=dl_{f['unique_id']}"
+            buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
 
     nav = []
     if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
@@ -215,16 +234,18 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
     if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
     if nav: buttons.append(nav)
     
-    text = f"🔍 **Found {total} files**"
-    if is_edit: await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    text = f"🔍 **Found {total} results**"
+    if is_edit:
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     else:
         sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        # Timer: Delete Result list in 10 mins
         add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
 
 # -----------------------------------------------------------------------------
-# 6. BOT CLIENT & HANDLERS
+# 6. HANDLERS
 # -----------------------------------------------------------------------------
-app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("BSMoviesBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
@@ -234,19 +255,18 @@ async def start_handler(client, message):
         for f in FILES_CACHE:
             if f['unique_id'] == uid:
                 sent = await client.send_cached_media(message.chat.id, f['file_id'], caption=f"📁 **{f['file_name']}**")
+                # Timer: Delete actual file in 2 mins
                 add_delete_task(message.chat.id, sent.id, time.time() + FILE_MSG_DELETE_TIME)
                 return
 
-    buttons = [
-        [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
-        [InlineKeyboardButton("🔎 Inline Search", switch_inline_query_current_chat="")]
-    ]
-    await message.reply_text(f"👋 Hi **{message.from_user.first_name}**!\nType a movie name to search.", reply_markup=InlineKeyboardMarkup(buttons))
+    btn = [[InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
+           [InlineKeyboardButton("🔎 Inline Search", switch_inline_query_current_chat="")]]
+    await message.reply_text(f"👋 Hi **{message.from_user.first_name}**!\nType movie name to search.", reply_markup=InlineKeyboardMarkup(btn))
 
 @app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
 async def stats_handler(client, message):
-    users, files = len(get_all_users()), len(FILES_CACHE)
-    await message.reply_text(f"📊 **Bot Stats**\n\n📂 Files: `{files}`\n👤 Users: `{users}`")
+    u, f = len(get_all_users()), len(FILES_CACHE)
+    await message.reply_text(f"📊 **Stats**\n\n📂 Files: `{f}`\n👤 Users: `{u}`")
 
 @app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
 async def broadcast_handler(client, message):
@@ -255,7 +275,7 @@ async def broadcast_handler(client, message):
     for u in users:
         try: await message.reply_to_message.copy(int(u)); await asyncio.sleep(0.1)
         except: pass
-    await message.reply_text("✅ Broadcast Done.")
+    await message.reply_text("✅ Done.")
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_channel(client, message):
@@ -294,23 +314,23 @@ async def callback_handler(client, cb):
         await send_results_page(cb.message, data[1], int(data[2]), is_edit=True); await cb.answer()
     elif data[0] == "req":
         btn = [[InlineKeyboardButton("✅ Mark Uploaded", callback_data=f"done|{cb.from_user.id}|{data[1]}")]]
-        await client.send_message(ADMIN_ID, f"📝 **New Request**\nUser: {cb.from_user.first_name}\nMovie: `{data[1]}`", reply_markup=InlineKeyboardMarkup(btn))
+        await client.send_message(ADMIN_ID, f"📝 **Request**\nUser: {cb.from_user.first_name}\nMovie: `{data[1]}`", reply_markup=InlineKeyboardMarkup(btn))
         await cb.answer("✅ Request Sent!", show_alert=True); await cb.message.delete()
     elif data[0] == "done":
-        try: await client.send_message(int(data[1]), f"🍿 Good News! `{data[2]}` is now available!")
+        try: await client.send_message(int(data[1]), f"🍿 Good News! `{data[2]}` is available now!")
         except: pass
-        await cb.answer("Notified!"); await cb.message.edit_text(f"✅ Resolved: {data[2]}")
+        await cb.message.edit_text(f"✅ Resolved: {data[2]}")
     elif data[0] == "close_data": await cb.message.delete()
 
 # -----------------------------------------------------------------------------
-# 7. STARTUP
+# 7. EXECUTION
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
     refresh_cache()
     app.start()
     BOT_USERNAME = app.get_me().username
-    print(f"✅ @{BOT_USERNAME} Started")
+    print(f"🤖 @{BOT_USERNAME} Started")
     loop = asyncio.get_event_loop()
     loop.create_task(check_auto_delete())
     from pyrogram import idle
