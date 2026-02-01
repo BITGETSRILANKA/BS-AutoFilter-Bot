@@ -165,24 +165,24 @@ def clean_text(text):
 
 # --- IMPROVED TITLE CLEANER (Removes @Tags and [Tags]) ---
 def extract_proper_title(text):
-    # 1. Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
+    # Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
     text = re.sub(r'\[.*?\]', '', text)
-
-    # 2. Remove words starting with @ (e.g. @Netflix_Villa)
+    
+    # Remove words starting with @ (e.g. @Netflix_Villa)
     text = re.sub(r'@\w+', '', text)
-
-    # 3. Replace separators with space
+    
+    # Replace separators with space
     text = re.sub(r'[._-()]', ' ', text)
-
-    # 4. Remove extra spaces
+    
+    # Remove extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
-
-    # 5. Cut off at "Junk" keywords (Year, Season, Quality)
+    
+    # Cut off at "Junk" keywords (Year, Season, Quality)
     pattern = r'(?i)(\s(s\d{1,2}|e\d{1,2}|season|episode|\d{4}|720p|1080p|4k|mkv|mp4|avi|hindi|eng|dual))'
     match = re.search(pattern, text)
     if match:
         text = text[:match.start()]
-
+    
     return text.strip().title()
 
 def get_system_stats():
@@ -223,7 +223,7 @@ async def start_handler(client, message):
         unique_id = message.command[1].split("_")[1]
         await send_file_to_user(client, message.chat.id, unique_id)
         return
-
+    
     buttons = [
         [InlineKeyboardButton("➕ Add Me To Your Group", url=f"https://t.me/{BOT_USERNAME}?startgroup=true")],
         [InlineKeyboardButton("🔎 Inline Search", switch_inline_query_current_chat="")]
@@ -251,10 +251,10 @@ async def delete_handler(client, message):
         if media: unique_id = media.file_unique_id
     elif len(message.command) > 1:
         unique_id = message.command[1]
-
+    
     if not unique_id:
         return await message.reply_text("❌ Reply to a file or provide Unique ID.")
-
+    
     if delete_file_from_db(unique_id):
         await message.reply_text(f"🗑️ File {unique_id} deleted.")
     else:
@@ -264,7 +264,7 @@ async def delete_handler(client, message):
 async def index_channel(client, message):
     if len(message.command) < 2:
         return await message.reply_text("❌ Usage: /index https://t.me/channel")
-
+    
     target = message.command[1]
     status_msg = await message.reply_text(f"⏳ Connecting to {target}...")
     try:
@@ -272,7 +272,7 @@ async def index_channel(client, message):
         chat_id = chat.id
     except Exception as e:
         return await status_msg.edit(f"❌ Error: {e}")
-
+    
     count = 0
     new_files = 0
     try:
@@ -305,7 +305,7 @@ async def index_new_post(client, message):
     filename = getattr(media, "file_name", None) or "Unknown"
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
         filename = message.caption.splitlines()[0]
-
+    
     data = {
         "file_name": filename,
         "file_size": media.file_size,
@@ -318,34 +318,33 @@ async def index_new_post(client, message):
 
 # MAIN SEARCH LOGIC
 async def perform_search(client, message, query, is_correction=False):
-
     # Auto-delete User Input after 5 Minutes
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
-
+    
     clean_query = clean_text(query)
     raw_query = query.lower().split()
     results = []
-
+    
     # 1. Exact & Split Match
     for file in FILES_CACHE:
         fname = clean_text(file.get('file_name', ''))
         capt = clean_text(file.get('caption', ''))
-
+        
         if clean_query in fname or clean_query in capt:
             results.append(file)
             continue
         if all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
-
+    
     # 2. IF RESULTS FOUND -> Show File List
     if results:
         # Generate Unique ID for this search instance
         search_id = str(uuid.uuid4())[:8]
         SEARCH_DATA_CACHE[search_id] = results
-
+        
         await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
-
+    
     # 3. SUGGESTIONS
     suggestions = []
     if FUZZY_AVAILABLE:
@@ -355,10 +354,10 @@ async def perform_search(client, message, query, is_correction=False):
             clean_t = extract_proper_title(f.get('file_name', ''))
             if len(clean_t) > 2:
                 unique_titles.add(clean_t)
-
+        
         choices = list(unique_titles)
         matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
-
+        
         seen = set()
         for match_name, score, index in matches:
             if score > 50:
@@ -366,7 +365,7 @@ async def perform_search(client, message, query, is_correction=False):
                     suggestions.append(match_name)
                     seen.add(match_name)
             if len(suggestions) >= 6: break
-
+    
     # 4. SEND RESPONSE
     if suggestions:
         btn = []
@@ -374,27 +373,27 @@ async def perform_search(client, message, query, is_correction=False):
             # Button Text = Clean Name
             cb_data = f"sp|{sugg[:40]}"
             btn.append([InlineKeyboardButton(f"{sugg}", callback_data=cb_data)])
-
+        
         btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
-
+        
         text = (
-            f"⚠️ **I am not able to search with your given query.**\n"
+            f"⚠️ I am not able to search with your given query.\n"
             f"Maybe your spelling is wrong.\n\n"
-            f"‼️ **Is there any of this?** 👇"
+            f"‼️ Is there any of this? 👇"
         )
-
+        
         if is_correction:
             sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
-
+        
         add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
-
+    
     else:
         # No results
         btn = [[InlineKeyboardButton(f"🙋‍♂️ Request {query[:15]}...", callback_data=f"req|{query[:20]}")]]
         text = f"🚫 No movie found for: {query}\nCheck spelling or request it."
-
+        
         if is_correction:
             sent_msg = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
         else:
@@ -407,6 +406,7 @@ async def search_handler(client, message):
     if message.text.startswith("/") or message.via_bot: return
     query = message.text.strip()
     if len(query) < 2: return
+    
     await perform_search(client, message, query, is_correction=False)
 
 @app.on_inline_query()
@@ -438,7 +438,7 @@ async def send_file_to_user(client, chat_id, unique_id):
     file_data = get_file_by_id(unique_id)
     if not file_data:
         return await client.send_message(chat_id, "❌ File removed.")
-
+    
     caption = (
         f"📁 {file_data['file_name']}\n"
         f"📊 Size: {get_size(file_data['file_size'])}\n\n"
@@ -459,12 +459,12 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
     if not results:
         if is_edit: await message.edit_text("⚠️ Expired. Search again.")
         return
-
+    
     total = len(results)
     total_pages = math.ceil(total / RESULTS_PER_PAGE)
     start = (page - 1) * RESULTS_PER_PAGE
     current = results[start : start + RESULTS_PER_PAGE]
-
+    
     buttons = []
     for file in current:
         name = file['file_name'][:30]
@@ -475,18 +475,18 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
         else:
             url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
-
+    
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
     if page < total_pages:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
-
+    
     if nav: buttons.append(nav)
-
+    
     text = f"🔍 Found {total} files\nPage {page}/{total_pages}"
-
+    
     try:
         if is_edit:
             await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -499,16 +499,16 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
 @app.on_callback_query()
 async def callback_handler(client, cb):
     data = cb.data.split("|")
-
+    
     if data[0] == "dl":
         await cb.answer()
         await send_file_to_user(client, cb.message.chat.id, data[1])
-
+    
     elif data[0] == "page":
         search_id = data[1]
         page_num = int(data[2])
         await send_results_page(cb.message, search_id, page=page_num, is_edit=True)
-
+    
     elif data[0] == "req":
         query = data[1]
         user = cb.from_user
@@ -519,15 +519,15 @@ async def callback_handler(client, cb):
             await cb.message.delete()
         except:
             await cb.answer("❌ Failed to send request.")
-
+    
     elif data[0] == "sp":
         correct_query = data[1]
         await cb.answer()
         await perform_search(client, cb.message, correct_query, is_correction=True)
-
+    
     elif data[0] == "close_data":
         await cb.message.delete()
-
+    
     elif data[0] == "noop":
         await cb.answer()
 
@@ -535,16 +535,16 @@ async def callback_handler(client, cb):
 if __name__ == "__main__":
     threading.Thread(target=run_http_server, daemon=True).start()
     refresh_cache()
-
+    
     print("🤖 Bot Starting...")
     app.start()
-
+    
     me = app.get_me()
     BOT_USERNAME = me.username
-
+    
     loop = asyncio.get_event_loop()
     loop.create_task(check_auto_delete())
-
+    
     print(f"✅ Bot Started as @{BOT_USERNAME}")
     from pyrogram import idle
     idle()
