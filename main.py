@@ -10,27 +10,15 @@ import psutil
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Pyrogram
+# Libraries
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    InlineQueryResultCachedDocument
 )
-
-# Firebase
 import firebase_admin
 from firebase_admin import credentials, db
-
-# IMDb (Cinemagoer) - No API Key Required
-from imdb import Cinemagoer
-
-# Fuzzy Search
-try:
-    from rapidfuzz import process, fuzz
-    FUZZY_AVAILABLE = True
-except ImportError:
-    FUZZY_AVAILABLE = False
+from imdb import Cinemagoer  # IMDb Search
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -42,7 +30,7 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 DB_URL = os.environ.get("DB_URL", "")
 FIREBASE_KEY = os.environ.get("FIREBASE_KEY", "") 
-PORT = int(os.environ.get('PORT', 8080))
+PORT = int(os.environ.get('PORT', 8080)) # Vital for Health Check
 
 # Timers
 FILE_MSG_DELETE_TIME = 120
@@ -56,7 +44,7 @@ SUGGESTION_DELETE_TIME = 300
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("BSFilterBot")
 
-ia = Cinemagoer()
+ia = Cinemagoer() # IMDb Client
 
 if not firebase_admin._apps:
     try:
@@ -73,9 +61,22 @@ BOT_USERNAME = ""
 RESULTS_PER_PAGE = 10
 
 # -----------------------------------------------------------------------------
-# 3. HELPER FUNCTIONS
+# 3. HEALTH CHECK SERVER (Prevents the bot from being killed)
 # -----------------------------------------------------------------------------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is Live and Running!")
 
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+    logger.info(f"🚀 Health check server started on port {PORT}")
+    server.serve_forever()
+
+# -----------------------------------------------------------------------------
+# 4. HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
 def refresh_cache():
     global FILES_CACHE
     try:
@@ -83,7 +84,7 @@ def refresh_cache():
         snapshot = ref.get()
         if snapshot:
             FILES_CACHE = list(snapshot.values())
-        logger.info(f"🚀 Cache Refreshed: {len(FILES_CACHE)} files in RAM")
+        logger.info(f"📂 Cache Updated: {len(FILES_CACHE)} files in memory")
     except Exception as e:
         logger.error(f"Cache Refresh Error: {e}")
 
@@ -100,29 +101,18 @@ def clean_text(text):
 # IMDb Suggestion Engine
 def get_imdb_suggestions(query):
     try:
+        # ia.search_movie handles spelling mistakes automatically
         search_results = ia.search_movie(query)
         suggestions = []
         for movie in search_results:
             if movie.get('kind') in ['movie', 'tv series']:
                 title = movie.get('title')
                 year = movie.get('year')
+                # Returns: "Movie Name (2024)"
                 suggestions.append(f"{title} ({year})" if year else title)
             if len(suggestions) >= 6: break
         return suggestions
     except: return []
-
-# -----------------------------------------------------------------------------
-# 4. DATABASE OPERATIONS
-# -----------------------------------------------------------------------------
-
-def add_file_to_db(file_data):
-    for f in FILES_CACHE:
-        if f['unique_id'] == file_data['unique_id']: return False
-    try:
-        db.reference(f'files/{file_data["unique_id"]}').set(file_data)
-        FILES_CACHE.append(file_data) 
-        return True
-    except: return False
 
 def add_delete_task(chat_id, message_id, delete_time):
     try:
@@ -132,39 +122,20 @@ def add_delete_task(chat_id, message_id, delete_time):
     except: pass
 
 # -----------------------------------------------------------------------------
-# 5. BOT CLIENT & BACKGROUND TASKS
+# 5. SEARCH LOGIC
 # -----------------------------------------------------------------------------
-app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-async def auto_delete_monitor():
-    while True:
-        try:
-            ref = db.reference('delete_queue')
-            tasks = ref.get()
-            now = time.time()
-            if tasks:
-                for key, val in tasks.items():
-                    if val['delete_time'] <= now:
-                        try: await app.delete_messages(val['chat_id'], val['message_id'])
-                        except: pass
-                        ref.child(key).delete()
-        except: pass
-        await asyncio.sleep(15)
-
-# -----------------------------------------------------------------------------
-# 6. SEARCH LOGIC
-# -----------------------------------------------------------------------------
-
 async def perform_search(client, message, query, is_correction=False):
+    # Auto-delete user request
     add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
     raw_query = query.lower().split()
     results = []
     
-    # Local Search
+    # 1. Search Local Database
     for file in FILES_CACHE:
         fname = clean_text(file.get('file_name', ''))
+        # Match "Kaavalan" even if file is "Fm Kaavalan"
         if clean_query in fname or all(w in fname for w in raw_query):
             results.append(file)
 
@@ -174,25 +145,25 @@ async def perform_search(client, message, query, is_correction=False):
         await send_results_page(message, search_id, page=1, is_edit=is_correction)
         return
 
-    # IMDb Suggestions (If nothing found)
+    # 2. If nothing found, get suggestions from IMDb
     suggestions = get_imdb_suggestions(query)
     
     if suggestions:
         btn = []
         for sugg in suggestions:
-            # Strip year for the search callback
+            # Strip year " (2011)" to keep search efficient
             clean_sugg = re.sub(r'\(.*?\)', '', sugg).strip()
             btn.append([InlineKeyboardButton(sugg, callback_data=f"sp|{clean_sugg[:40]}")])
         btn.append([InlineKeyboardButton("🚫 CLOSE 🚫", callback_data="close_data")])
         
-        text = f"⚠️ **No files found for:** `{query}`\n\n‼️ **Did you mean?** 👇"
+        text = f"⚠️ **I couldn't find anything for:** `{query}`\n\n‼️ **Is it one of these?** 👇"
         if is_correction:
             sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(btn))
         else:
             sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         add_delete_task(sent.chat.id, sent.id, time.time() + SUGGESTION_DELETE_TIME)
     else:
-        text = f"🚫 **No results found for:** `{query}`"
+        text = f"🚫 **No movie found for:** `{query}`"
         if is_correction: await message.edit_text(text)
         else: await message.reply_text(text)
 
@@ -222,14 +193,32 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
     if nav: buttons.append(nav)
     
     text = f"🔍 **Found {total} results**"
-    if is_edit: await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    else:
-        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-        add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
+    try:
+        if is_edit: await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            add_delete_task(sent.chat.id, sent.id, time.time() + RESULT_MSG_DELETE_TIME)
+    except: pass
 
 # -----------------------------------------------------------------------------
-# 7. HANDLERS
+# 6. BOT CLIENT & BACKGROUND TASKS
 # -----------------------------------------------------------------------------
+app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+async def auto_delete_monitor():
+    while True:
+        try:
+            ref = db.reference('delete_queue')
+            tasks = ref.get()
+            now = time.time()
+            if tasks:
+                for key, val in tasks.items():
+                    if val['delete_time'] <= now:
+                        try: await app.delete_messages(val['chat_id'], val['message_id'])
+                        except: pass
+                        ref.child(key).delete()
+        except: pass
+        await asyncio.sleep(20)
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message):
@@ -258,7 +247,7 @@ async def callback_handler(client, cb):
                 await cb.answer()
                 return
     elif data[0] == "sp":
-        await cb.answer("Searching for corrected title...")
+        await cb.answer("🔍 Re-searching for correct title...")
         await perform_search(client, cb.message, data[1], is_correction=True)
     elif data[0] == "page":
         await send_results_page(cb.message, data[1], int(data[2]), is_edit=True)
@@ -266,21 +255,26 @@ async def callback_handler(client, cb):
     elif data[0] == "close_data":
         await cb.message.delete()
 
-@app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
-async def auto_index(client, message):
-    media = message.document or message.video
-    name = getattr(media, "file_name", "Unknown")
-    data = {"file_name": name, "file_size": media.file_size, "file_id": media.file_id, "unique_id": media.file_unique_id}
-    if add_file_to_db(data): logger.info(f"Indexed: {name}")
-
 # -----------------------------------------------------------------------------
-# 8. STARTUP
+# 7. MAIN EXECUTION
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    # 1. Start Health Check Server in a separate thread
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Sync Files
     refresh_cache()
+    
+    # 3. Start Pyrogram
     app.start()
+    
     BOT_USERNAME = app.get_me().username
-    print(f"✅ Bot is live: @{BOT_USERNAME}")
-    asyncio.get_event_loop().create_task(auto_delete_monitor())
+    print(f"✅ @{BOT_USERNAME} is Live!")
+    
+    # 4. Start Background Tasks
+    loop = asyncio.get_event_loop()
+    loop.create_task(auto_delete_monitor())
+    
     from pyrogram import idle
     idle()
+    app.stop()
