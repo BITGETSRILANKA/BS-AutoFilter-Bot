@@ -77,6 +77,9 @@ def refresh_cache():
         if snapshot:
             FILES_CACHE = list(snapshot.values())
             logger.info(f"🚀 Cache Refreshed: {len(FILES_CACHE)} files in RAM")
+        else:
+            FILES_CACHE = []
+            logger.warning("⚠️ No files found in database")
     except Exception as e:
         logger.error(f"Cache Refresh Error: {e}")
 
@@ -88,6 +91,7 @@ def add_file_to_db(file_data):
         ref = db.reference(f'files/{file_data["unique_id"]}')
         ref.set(file_data)
         FILES_CACHE.append(file_data)
+        logger.info(f"✅ Added file: {file_data['file_name'][:50]}")
         return True
     except Exception as e:
         logger.error(f"DB Write Error: {e}")
@@ -98,6 +102,7 @@ def delete_file_from_db(unique_id):
     try:
         db.reference(f'files/{unique_id}').delete()
         FILES_CACHE = [f for f in FILES_CACHE if f['unique_id'] != unique_id]
+        logger.info(f"🗑️ Deleted file: {unique_id}")
         return True
     except Exception as e:
         logger.error(f"DB Delete Error: {e}")
@@ -113,14 +118,19 @@ def add_user(user_id):
     if user_id < 0: return
     try:
         ref = db.reference(f'users/{user_id}')
-        if not ref.get(): ref.set({"active": True})
-    except: pass
+        if not ref.get(): 
+            ref.set({"active": True})
+            logger.info(f"👤 New user added: {user_id}")
+    except Exception as e:
+        logger.error(f"Add user error: {e}")
 
 def get_all_users():
     try:
         snap = db.reference('users').get()
         return list(snap.keys()) if snap else []
-    except: return []
+    except Exception as e:
+        logger.error(f"Get users error: {e}")
+        return []
 
 # --- Auto Delete Logic ---
 def add_delete_task(chat_id, message_id, delete_time):
@@ -131,7 +141,8 @@ def add_delete_task(chat_id, message_id, delete_time):
             "message_id": message_id,
             "delete_time": delete_time
         })
-    except: pass
+    except Exception as e:
+        logger.error(f"Add delete task error: {e}")
 
 def get_due_delete_tasks():
     try:
@@ -145,11 +156,15 @@ def get_due_delete_tasks():
                     val['key'] = key
                     tasks.append(val)
         return tasks
-    except: return []
+    except Exception as e:
+        logger.error(f"Get delete tasks error: {e}")
+        return []
 
 def remove_delete_task(key):
-    try: db.reference(f'delete_queue/{key}').delete()
-    except: pass
+    try: 
+        db.reference(f'delete_queue/{key}').delete()
+    except Exception as e:
+        logger.error(f"Remove delete task error: {e}")
 
 def get_size(size):
     if not size: return "0B"
@@ -161,10 +176,15 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 def clean_text(text):
+    if not text:
+        return ""
     return re.sub(r'[\W_]+', ' ', text).lower().strip()
 
 # --- IMPROVED TITLE CLEANER (Removes @Tags and [Tags]) ---
 def extract_proper_title(text):
+    if not text:
+        return ""
+    
     # Remove stuff inside [ brackets ] (e.g. [ @Netflix... ])
     text = re.sub(r'\[.*?\]', '', text)
     
@@ -195,8 +215,12 @@ app = Client("BSFilterBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
         self.wfile.write(b"Bot is Running")
+    
+    def log_message(self, format, *args):
+        pass  # Disable default logging
 
 def run_http_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
@@ -210,9 +234,12 @@ async def check_auto_delete():
             for task in tasks:
                 try:
                     await app.delete_messages(task['chat_id'], task['message_id'])
-                except Exception: pass
+                    logger.info(f"🗑️ Auto-deleted message {task['message_id']} in chat {task['chat_id']}")
+                except Exception as e:
+                    logger.error(f"Failed to delete message: {e}")
                 remove_delete_task(task['key'])
-        except Exception: pass
+        except Exception as e:
+            logger.error(f"Auto-delete loop error: {e}")
         await asyncio.sleep(10)
 
 # BOT HANDLERS
@@ -248,7 +275,8 @@ async def delete_handler(client, message):
     unique_id = None
     if message.reply_to_message:
         media = message.reply_to_message.document or message.reply_to_message.video
-        if media: unique_id = media.file_unique_id
+        if media: 
+            unique_id = media.file_unique_id
     elif len(message.command) > 1:
         unique_id = message.command[1]
     
@@ -270,6 +298,7 @@ async def index_channel(client, message):
     try:
         chat = await client.get_chat(target)
         chat_id = chat.id
+        await status_msg.edit(f"✅ Connected to {chat.title}\n⏳ Starting index...")
     except Exception as e:
         return await status_msg.edit(f"❌ Error: {e}")
     
@@ -277,11 +306,17 @@ async def index_channel(client, message):
     new_files = 0
     try:
         async for msg in client.get_chat_history(chat_id):
-            media = msg.document or msg.video
-            if media:
+            if msg.document or msg.video:
+                media = msg.document or msg.video
                 filename = getattr(media, "file_name", None) or "Unknown"
+                
+                # Try to get filename from caption if missing
                 if (not filename or filename == "Unknown" or filename.startswith("Video_")) and msg.caption:
-                    filename = msg.caption.splitlines()[0]
+                    # Extract first line from caption as filename
+                    caption_lines = msg.caption.split('\n')
+                    if caption_lines:
+                        filename = caption_lines[0].strip()
+                
                 data = {
                     "file_name": filename,
                     "file_size": media.file_size,
@@ -292,8 +327,9 @@ async def index_channel(client, message):
                 if add_file_to_db(data):
                     new_files += 1
                 count += 1
-                if count % 200 == 0:
+                if count % 50 == 0:
                     await status_msg.edit(f"🔄 Scanned: {count}\n✅ Added: {new_files}")
+        
         await status_msg.edit(f"✅ Indexing Complete\n\n📄 Scanned: {count}\n📂 Added: {new_files}")
     except Exception as e:
         await status_msg.edit(f"❌ Indexing Stopped: {e}")
@@ -301,10 +337,16 @@ async def index_channel(client, message):
 @app.on_message(filters.chat(CHANNEL_ID) & (filters.document | filters.video))
 async def index_new_post(client, message):
     media = message.document or message.video
-    if not media: return
+    if not media: 
+        return
+    
     filename = getattr(media, "file_name", None) or "Unknown"
+    
+    # Try to get filename from caption if missing
     if (not filename or filename == "Unknown" or filename.startswith("Video_")) and message.caption:
-        filename = message.caption.splitlines()[0]
+        caption_lines = message.caption.split('\n')
+        if caption_lines:
+            filename = caption_lines[0].strip()
     
     data = {
         "file_name": filename,
@@ -315,11 +357,17 @@ async def index_new_post(client, message):
     }
     if add_file_to_db(data):
         logger.info(f"✅ Indexed: {filename}")
+    else:
+        logger.info(f"⚠️ Already indexed: {filename}")
 
 # MAIN SEARCH LOGIC
 async def perform_search(client, message, query, is_correction=False):
+    if not query or len(query) < 2:
+        return
+    
     # Auto-delete User Input after 5 Minutes
-    add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
+    if not is_correction:
+        add_delete_task(message.chat.id, message.id, time.time() + USER_MSG_DELETE_TIME)
     
     clean_query = clean_text(query)
     raw_query = query.lower().split()
@@ -333,7 +381,8 @@ async def perform_search(client, message, query, is_correction=False):
         if clean_query in fname or clean_query in capt:
             results.append(file)
             continue
-        if all(w in file.get('file_name', '').lower() for w in raw_query):
+        
+        if raw_query and all(w in file.get('file_name', '').lower() for w in raw_query):
             results.append(file)
     
     # 2. IF RESULTS FOUND -> Show File List
@@ -347,7 +396,7 @@ async def perform_search(client, message, query, is_correction=False):
     
     # 3. SUGGESTIONS
     suggestions = []
-    if FUZZY_AVAILABLE:
+    if FUZZY_AVAILABLE and clean_query:
         unique_titles = set()
         for f in FILES_CACHE:
             # THIS IS WHERE IT GETS CLEANED (Removes [Tags] and @Tags)
@@ -355,16 +404,18 @@ async def perform_search(client, message, query, is_correction=False):
             if len(clean_t) > 2:
                 unique_titles.add(clean_t)
         
-        choices = list(unique_titles)
-        matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
-        
-        seen = set()
-        for match_name, score, index in matches:
-            if score > 50:
-                if match_name not in seen:
-                    suggestions.append(match_name)
-                    seen.add(match_name)
-            if len(suggestions) >= 6: break
+        if unique_titles:
+            choices = list(unique_titles)
+            matches = process.extract(clean_query, choices, limit=10, scorer=fuzz.WRatio)
+            
+            seen = set()
+            for match_name, score, index in matches:
+                if score > 50:
+                    if match_name not in seen:
+                        suggestions.append(match_name)
+                        seen.add(match_name)
+                if len(suggestions) >= 6: 
+                    break
     
     # 4. SEND RESPONSE
     if suggestions:
@@ -387,7 +438,7 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
-        add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
+        add_delete_task(sent_msg.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
     
     else:
         # No results
@@ -399,50 +450,75 @@ async def perform_search(client, message, query, is_correction=False):
         else:
             sent_msg = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(btn))
         
-        add_delete_task(message.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
+        add_delete_task(sent_msg.chat.id, sent_msg.id, time.time() + SUGGESTION_DELETE_TIME)
 
 @app.on_message(filters.text & (filters.private | filters.group))
 async def search_handler(client, message):
-    if message.text.startswith("/") or message.via_bot: return
+    if message.text.startswith("/") or message.via_bot: 
+        return
+    
     query = message.text.strip()
-    if len(query) < 2: return
+    if len(query) < 2: 
+        return await message.reply_text("❌ Query too short. Enter at least 2 characters.")
     
     await perform_search(client, message, query, is_correction=False)
 
 @app.on_inline_query()
 async def inline_handler(client, query):
     text = query.query.strip()
-    if not text: return
+    if not text: 
+        return
+    
     clean_q = clean_text(text)
     raw_q = text.lower().split()
     results = []
     count = 0
+    
     for file in FILES_CACHE:
-        if count >= 50: break
+        if count >= 50: 
+            break
+        
         fname = clean_text(file.get('file_name', ''))
-        if clean_q in fname or all(w in file.get('file_name', '').lower() for w in raw_q):
+        
+        if clean_q in fname:
             count += 1
             size = get_size(file['file_size'])
             results.append(
                 InlineQueryResultCachedDocument(
                     id=file['unique_id'],
-                    title=file['file_name'],
+                    title=file['file_name'][:50],
                     document_file_id=file['file_id'],
                     description=f"Size: {size}",
-                    caption=f"📁 {file['file_name']}\n📊 Size: {size}"
+                    caption=f"📁 {file['file_name']}\n📊 Size: {size}\n\n🔗 via @{BOT_USERNAME}"
                 )
             )
-    await query.answer(results, cache_time=10)
+            continue
+        
+        # Also check with split words
+        if raw_q and all(w in file.get('file_name', '').lower() for w in raw_q):
+            count += 1
+            size = get_size(file['file_size'])
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id=file['unique_id'],
+                    title=file['file_name'][:50],
+                    document_file_id=file['file_id'],
+                    description=f"Size: {size}",
+                    caption=f"📁 {file['file_name']}\n📊 Size: {size}\n\n🔗 via @{BOT_USERNAME}"
+                )
+            )
+    
+    await query.answer(results, cache_time=10, is_gallery=False)
 
 async def send_file_to_user(client, chat_id, unique_id):
     file_data = get_file_by_id(unique_id)
     if not file_data:
-        return await client.send_message(chat_id, "❌ File removed.")
+        return await client.send_message(chat_id, "❌ File removed or not found.")
     
     caption = (
         f"📁 {file_data['file_name']}\n"
         f"📊 Size: {get_size(file_data['file_size'])}\n\n"
-        f"⏳ Deleted in 2 mins."
+        f"⏳ This message will be deleted in 2 minutes."
     )
     try:
         sent = await client.send_cached_media(
@@ -451,24 +527,39 @@ async def send_file_to_user(client, chat_id, unique_id):
             caption=caption
         )
         add_delete_task(chat_id, sent.id, time.time() + FILE_MSG_DELETE_TIME)
+        logger.info(f"📤 Sent file {unique_id} to user {chat_id}")
     except Exception as e:
         logger.error(f"Send Error: {e}")
+        await client.send_message(chat_id, f"❌ Error sending file: {e}")
 
 async def send_results_page(message, search_id, page=1, is_edit=False):
     results = SEARCH_DATA_CACHE.get(search_id)
     if not results:
-        if is_edit: await message.edit_text("⚠️ Expired. Search again.")
+        if is_edit: 
+            await message.edit_text("⚠️ Search expired. Please search again.")
         return
     
     total = len(results)
+    if total == 0:
+        if is_edit:
+            await message.edit_text("⚠️ No files found.")
+        return
+    
     total_pages = math.ceil(total / RESULTS_PER_PAGE)
+    page = max(1, min(page, total_pages))  # Ensure page is within bounds
+    
     start = (page - 1) * RESULTS_PER_PAGE
-    current = results[start : start + RESULTS_PER_PAGE]
+    end = start + RESULTS_PER_PAGE
+    current = results[start:end]
     
     buttons = []
     for file in current:
-        name = file['file_name'][:30]
+        name = file['file_name']
+        if len(name) > 30:
+            name = name[:27] + "..."
+        
         size = get_size(file['file_size'])
+        
         if message.chat.type == enums.ChatType.PRIVATE:
             cb_data = f"dl|{file['unique_id']}"
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", callback_data=cb_data)])
@@ -476,16 +567,23 @@ async def send_results_page(message, search_id, page=1, is_edit=False):
             url = f"https://t.me/{BOT_USERNAME}?start=dl_{file['unique_id']}"
             buttons.append([InlineKeyboardButton(f"[{size}] {name}", url=url)])
     
+    # Navigation buttons
     nav = []
     if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page|{search_id}|{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page|{search_id}|{page-1}"))
+    
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+    
     if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page|{search_id}|{page+1}"))
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page|{search_id}|{page+1}"))
     
-    if nav: buttons.append(nav)
+    if nav: 
+        buttons.append(nav)
     
-    text = f"🔍 Found {total} files\nPage {page}/{total_pages}"
+    # Add close button
+    buttons.append([InlineKeyboardButton("🚫 Close", callback_data="close_data")])
+    
+    text = f"🔍 **Found {total} files**\n📄 Page {page}/{total_pages}"
     
     try:
         if is_edit:
@@ -508,6 +606,7 @@ async def callback_handler(client, cb):
         search_id = data[1]
         page_num = int(data[2])
         await send_results_page(cb.message, search_id, page=page_num, is_edit=True)
+        await cb.answer()
     
     elif data[0] == "req":
         query = data[1]
@@ -517,8 +616,9 @@ async def callback_handler(client, cb):
             await client.send_message(ADMIN_ID, text)
             await cb.answer("✅ Request Sent to Admin!", show_alert=True)
             await cb.message.delete()
-        except:
-            await cb.answer("❌ Failed to send request.")
+        except Exception as e:
+            await cb.answer("❌ Failed to send request.", show_alert=True)
+            logger.error(f"Request error: {e}")
     
     elif data[0] == "sp":
         correct_query = data[1]
@@ -527,13 +627,46 @@ async def callback_handler(client, cb):
     
     elif data[0] == "close_data":
         await cb.message.delete()
+        await cb.answer("Closed")
     
     elif data[0] == "noop":
         await cb.answer()
 
+# BROADCAST COMMAND (ADD THIS)
+@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
+async def broadcast_handler(client, message):
+    if not message.reply_to_message:
+        return await message.reply_text("❌ Reply to a message to broadcast.")
+    
+    users = get_all_users()
+    if not users:
+        return await message.reply_text("❌ No users found.")
+    
+    status = await message.reply_text(f"📤 Broadcasting to {len(users)} users...")
+    
+    success = 0
+    failed = 0
+    
+    for user_id in users:
+        try:
+            user_id_int = int(user_id)
+            await message.reply_to_message.copy(user_id_int)
+            success += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"Broadcast failed for {user_id}: {e}")
+        
+        # Small delay to avoid flood
+        await asyncio.sleep(0.1)
+    
+    await status.edit(f"✅ Broadcast Complete\n\n✅ Success: {success}\n❌ Failed: {failed}")
+
 # MAIN EXECUTION
 if __name__ == "__main__":
+    # Start HTTP server in background
     threading.Thread(target=run_http_server, daemon=True).start()
+    
+    # Refresh cache from Firebase
     refresh_cache()
     
     print("🤖 Bot Starting...")
@@ -546,6 +679,9 @@ if __name__ == "__main__":
     loop.create_task(check_auto_delete())
     
     print(f"✅ Bot Started as @{BOT_USERNAME}")
+    print(f"🌐 HTTP Server running on port {PORT}")
+    print(f"📂 Files in cache: {len(FILES_CACHE)}")
+    
     from pyrogram import idle
     idle()
     app.stop()
